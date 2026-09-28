@@ -880,6 +880,11 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// --serve: a request that shares no prefix with the cached conversation and whose prompt is at most N tokens (an
+    /// Open WebUI title/tag/follow-up request) runs WITHOUT evicting that conversation: the cells it will overwrite in
+    /// the KV host copies, the indexer's pooled rows and the checkpoints are set aside first and put back after it.
+    /// Needs KV streaming (--kv-resident) for the main layers and the drafter's ring; 0 = off (the v0.1.6 behaviour).
+    int64_t side_stash = 0;
 };
 
 void usage() {
@@ -1034,6 +1039,8 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --side-stash N       --serve: a request of at most N prompt tokens that shares nothing with the cached\n"
+                 "                       conversation does not evict it (its cells are set aside and restored; 0 = off)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -3273,6 +3280,7 @@ int main(int argc, char** argv) {
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
+        else if (a == "--side-stash") o.side_stash = std::max(0LL, std::atoll(next("--side-stash")));
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
@@ -13395,6 +13403,101 @@ int main(int argc, char** argv) {
                 if (!pump(false)) return false;
             return pmtp_settle();
         };
+        // ---- --side-stash (Options::side_stash): what an unrelated short request would overwrite, set aside
+        struct SideStash {
+            bool active = false;
+            int64_t limit_cells = 0;    ///< the kept conversation's extent (its longest checkpoint)
+            int64_t saved_blocks = 0;   ///< host-copy blocks [0, saved_blocks) of every state are saved
+            std::vector<std::vector<uint8_t>> host;                 ///< per host-copy array, the saved prefix
+            std::vector<std::vector<uint8_t>> pooled, dead, bpos;   ///< per QSA layer: the indexer's rows
+            std::vector<ConvCheckpoint> checks;
+        } stash;
+        const strata::kernels::QsaShapes stash_qs = [&] {
+            strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+            s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_dim = g.idx_key_dim;
+            return s;
+        }();
+        // the host copies a request writes (identity layout [block][kv_head][page_size][...]): the QSA layers and
+        // the drafter's ring; (pointer, bytes per block)
+        auto stash_arrays = [&](std::vector<std::pair<uint8_t*, size_t>>& out) {
+            out.clear();
+            const size_t cells = (size_t) stash_qs.n_head_kv * (size_t) stash_qs.page_size;
+            auto add = [&](const strata::core::QsaState& st) {
+                if (st.kv_q4) {                            // q4_0 (v0.1.8): 144 B per cell and head, K and V
+                    out.emplace_back((uint8_t*) st.host.k_q4, cells * 144);
+                    out.emplace_back((uint8_t*) st.host.v_q4, cells * 144);
+                } else if (st.kv_int8) {
+                    out.emplace_back((uint8_t*) st.host.k_q, cells * (size_t) stash_qs.head_dim);
+                    out.emplace_back((uint8_t*) st.host.v_q, cells * (size_t) stash_qs.head_dim);
+                    out.emplace_back((uint8_t*) st.host.k_scale, cells * (size_t) (stash_qs.head_dim / 64) * 2);
+                    out.emplace_back((uint8_t*) st.host.v_scale, cells * (size_t) (stash_qs.head_dim / 64) * 2);
+                } else {
+                    out.emplace_back((uint8_t*) st.host.k_pool, cells * (size_t) stash_qs.head_dim * 2);
+                    out.emplace_back((uint8_t*) st.host.v_pool, cells * (size_t) stash_qs.head_dim * 2);
+                }
+            };
+            for (int64_t i = 0; i < g.n_qsa_layers(); ++i) add(ss.qsa_states[i]);
+            add(mtp.kv_state());
+        };
+        // only with KV streaming: the authoritative K/V is then in the host copies, which session_zero leaves alone
+        auto stash_supported = [&]() -> bool {
+            for (int64_t i = 0; i < g.n_qsa_layers(); ++i)
+                if (ss.qsa_states[i].kv_mode != 1 || !ss.qsa_states[i].host.present()) return false;
+            return mtp.kv_state().kv_mode == 2 && mtp.kv_state().host.present();
+        };
+        // the indexer's pooled rows (session_zero clears them all) and its two small per-sequence values
+        auto stash_begin = [&] {
+            cudaDeviceSynchronize();
+            std::vector<std::pair<uint8_t*, size_t>> arr;
+            stash_arrays(arr);
+            stash.host.assign(arr.size(), {});
+            const size_t rows = (size_t) (stash.limit_cells / stash_qs.idx_block + 2);
+            stash.pooled.assign((size_t) g.n_qsa_layers(), {});
+            stash.dead.assign((size_t) g.n_qsa_layers(), {});
+            stash.bpos.assign((size_t) g.n_qsa_layers(), {});
+            for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                const strata::core::QsaState& st = ss.qsa_states[i];
+                const size_t r = std::min<size_t>(rows, (size_t) st.idx_pooled_rows);
+                stash.pooled[(size_t) i].resize(r * (size_t) stash_qs.idx_dim * 4);
+                stash.dead[(size_t) i].resize((size_t) stash_qs.idx_dim * 4);
+                stash.bpos[(size_t) i].resize(4);
+                cudaMemcpy(stash.pooled[(size_t) i].data(), st.idx_pooled, stash.pooled[(size_t) i].size(), cudaMemcpyDefault);
+                cudaMemcpy(stash.dead[(size_t) i].data(), st.idx_dead, stash.dead[(size_t) i].size(), cudaMemcpyDefault);
+                cudaMemcpy(stash.bpos[(size_t) i].data(), st.idx_block_pos, 4, cudaMemcpyDefault);
+            }
+        };
+        // save host-copy blocks up to `cells` (+1024 ahead of the writes in flight; never past the kept conversation:
+        // cells beyond it hold nothing it reads) BEFORE this request writes them
+        auto stash_extend = [&](int64_t cells) {
+            cells = std::min(cells + 1024, stash.limit_cells);
+            const int64_t b1 = (cells + stash_qs.page_size - 1) / stash_qs.page_size;
+            if (b1 <= stash.saved_blocks) return;
+            std::vector<std::pair<uint8_t*, size_t>> arr;
+            stash_arrays(arr);
+            for (size_t a = 0; a < arr.size(); ++a) {
+                const size_t bpb = arr[a].second, off = stash.host[a].size();
+                stash.host[a].resize(off + (size_t) (b1 - stash.saved_blocks) * bpb);
+                cudaMemcpy(stash.host[a].data() + off, arr[a].first + (size_t) stash.saved_blocks * bpb,
+                           (size_t) (b1 - stash.saved_blocks) * bpb, cudaMemcpyDefault);
+            }
+            stash.saved_blocks = b1;
+        };
+        auto stash_end = [&] {
+            cudaDeviceSynchronize();
+            std::vector<std::pair<uint8_t*, size_t>> arr;
+            stash_arrays(arr);
+            for (size_t a = 0; a < arr.size(); ++a)
+                cudaMemcpy(arr[a].first, stash.host[a].data(), stash.host[a].size(), cudaMemcpyDefault);
+            for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                const strata::core::QsaState& st = ss.qsa_states[i];
+                cudaMemcpy(st.idx_pooled, stash.pooled[(size_t) i].data(), stash.pooled[(size_t) i].size(), cudaMemcpyDefault);
+                cudaMemcpy(st.idx_dead, stash.dead[(size_t) i].data(), stash.dead[(size_t) i].size(), cudaMemcpyDefault);
+                cudaMemcpy(st.idx_block_pos, stash.bpos[(size_t) i].data(), 4, cudaMemcpyDefault);
+                strata::kernels::kv_stream_reset(st.map, main_cs);   // its slots hold the side request's blocks
+            }
+            cudaDeviceSynchronize();
+            stash.host.clear(); stash.pooled.clear(); stash.dead.clear(); stash.bpos.clear();
+        };
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -14507,6 +14610,21 @@ int main(int argc, char** argv) {
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+            // ---- side stash: keep the cached conversation through an unrelated short request (see --side-stash)
+            // (not with STRATA_CKPT_POOL: the pool reuses a checkpoint's storage, the stash would still hold it)
+            stash.active = false;
+            if (o.side_stash > 0 && resume == 0 && !checks.empty() && n <= o.side_stash && stash_supported() &&
+                !ckpt_pool.on()) {
+                stash.active = true;
+                stash.limit_cells = 0;
+                for (const ConvCheckpoint& c : checks)
+                    stash.limit_cells = std::max<int64_t>(stash.limit_cells, (int64_t) c.ids.size());
+                stash.saved_blocks = 0;
+                stash.checks = std::move(checks);
+                checks.clear();
+                stash_begin();
+                stash_extend(n + 4 * S + 64);
+            }
             auto off_path = [&](const ConvCheckpoint& c) {
                 return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
             };
@@ -15656,6 +15774,7 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            if (stash.active) stash_extend(n + 4 * S + 64);
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -16720,6 +16839,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 tr("window", p, T);
+                if (stash.active) stash_extend(p + 4 * S + 64);
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
@@ -17068,6 +17188,19 @@ int main(int argc, char** argv) {
                              (unsigned long long) h_pool, (unsigned long long) h_kv, (unsigned long long) h_mtp,
                              (unsigned long long) h_stale, (unsigned long long) h_dead,
                              (unsigned long long) h_pool_full, ss.ple_prev[0], ss.ple_prev[1]);
+            }
+            if (stash.active) {
+                // after the side request: its own state is dropped, the conversation's cells, rows and checkpoints
+                // come back (the running state comes back with the checkpoint the next request resumes from)
+                stash_end();
+                checks = std::move(stash.checks);
+                stash.checks.clear();
+                live_ok = false;
+                live.clear();
+                std::fprintf(stderr, "strata serve: side stash: kept %zu checkpoints (up to %lld cells), restored %lld "
+                                     "blocks\n", checks.size(), (long long) stash.limit_cells,
+                             (long long) stash.saved_blocks);
+                stash.active = false;
             }
             const int64_t req_hits = drive.d.cache_hits - decode_hits0;
             const int64_t req_look = (drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused) - decode_look0;

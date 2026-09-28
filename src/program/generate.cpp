@@ -121,6 +121,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <iostream>
 #include <functional>
 #include <future>
+#include <memory>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -789,6 +790,8 @@ struct Options {
     /// the KV host copies, the indexer's pooled rows and the checkpoints are set aside first and put back after it.
     /// Needs KV streaming (--kv-resident) for the main layers and the drafter's ring; 0 = off (the v0.1.6 behaviour).
     int64_t side_stash = 0;
+    int chat_cache = 0;             ///< --chat-cache N: parked conversations kept in RAM (0 = off)
+    int64_t chat_cache_mib = 16384; ///< --chat-cache-mib: their RAM budget
 };
 
 void usage() {
@@ -941,6 +944,10 @@ void usage() {
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
                  "  --side-stash N       --serve: a request of at most N prompt tokens that shares nothing with the cached\n"
                  "                       conversation does not evict it (its cells are set aside and restored; 0 = off)\n"
+                 "  --chat-cache N       --serve: keep up to N other conversations in RAM (their KV cells and checkpoints):\n"
+                 "                       a request that continues one of them resumes where it left off instead of reading\n"
+                 "                       it again (least recently used dropped first; 0 = off; replaces --side-stash)\n"
+                 "  --chat-cache-mib M   the RAM those conversations may use (default 16384)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -2671,6 +2678,8 @@ int main(int argc, char** argv) {
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
         else if (a == "--side-stash") o.side_stash = std::max(0LL, std::atoll(next("--side-stash")));
+        else if (a == "--chat-cache") o.chat_cache = std::max(0, std::atoi(next("--chat-cache")));
+        else if (a == "--chat-cache-mib") o.chat_cache_mib = std::max(0LL, std::atoll(next("--chat-cache-mib")));
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
             std::string e;
@@ -11786,6 +11795,133 @@ int main(int argc, char** argv) {
             cudaDeviceSynchronize();
             stash.host.clear(); stash.pooled.clear(); stash.dead.clear(); stash.bpos.clear();
         };
+        // ---- --chat-cache (Options::chat_cache): other conversations parked in RAM.  A conversation is everything a
+        // later request needs to continue it: its checkpoints (running state) and the positional state below the
+        // longest one - the host copies of the QSA layers' and the drafter's K/V (the authoritative copies with KV
+        // streaming) and the indexer's pooled rows.  PARK copies them out when a request takes the session for another
+        // conversation; UNPARK copies a parked one back when a request continues it, and the request then resumes from
+        // its checkpoint as usual.  The device state needs nothing else: the QSA layers' VRAM slots are re-streamed
+        // (kv_stream_reset) and the drafter's ring is rebuilt from its host copy (mtp.kv_restore) on every resume.
+        struct Parked {
+            std::vector<ConvCheckpoint> checks;
+            int64_t cells = 0, blocks = 0;
+            std::vector<std::unique_ptr<uint8_t[]>> host;          // per host-copy array: blocks [0, blocks)
+            std::vector<std::vector<uint8_t>> pooled, dead, bpos;   // per QSA layer
+            bool cvec = true;
+            uint64_t used = 0;                                      // LRU clock
+            uint64_t id = 0;
+            size_t bytes = 0;
+        };
+        std::vector<Parked> chat_parked;
+        uint64_t park_clock = 0;
+        // host -> host copies of up to ~1.5 GB: split over threads (one core copies ~10 GB/s)
+        auto par_copy = [](uint8_t* dst, const uint8_t* src, size_t bytes) {
+            const size_t per = 64ull << 20;
+            if (bytes <= per) { std::memcpy(dst, src, bytes); return; }
+            const int nt = (int) std::min<size_t>(8, (bytes + per - 1) / per);
+            std::vector<std::thread> th;
+            const size_t chunk = (bytes + nt - 1) / nt;
+            for (int i = 0; i < nt; ++i) {
+                const size_t a = (size_t) i * chunk, b = std::min(bytes, a + chunk);
+                if (a < b) th.emplace_back([=] { std::memcpy(dst + a, src + a, b - a); });
+            }
+            for (auto& t : th) t.join();
+        };
+        auto longest_check = [&](const std::vector<ConvCheckpoint>& cs) {
+            int64_t L = 0;
+            for (const ConvCheckpoint& c : cs) L = std::max<int64_t>(L, (int64_t) c.ids.size());
+            return L;
+        };
+        auto park_bytes_total = [&] { size_t b = 0; for (const Parked& p : chat_parked) b += p.bytes; return b; };
+        // the live conversation (its checkpoints and the cells below the longest) into the store; `checks` is left empty
+        auto park = [&]() {
+            // a conversation shorter than this is never swapped back in (reading it is cheaper than a swap): drop it
+            if (checks.empty() || longest_check(checks) < 512) { checks.clear(); return; }
+            const auto t0 = Clock::now();
+            cudaDeviceSynchronize();
+            Parked pk;
+            pk.cells = longest_check(checks);
+            pk.blocks = std::min<int64_t>((pk.cells + stash_qs.page_size - 1) / stash_qs.page_size,
+                                          ss.qsa_states[0].max_cells / stash_qs.page_size);
+            std::vector<std::pair<uint8_t*, size_t>> arr;
+            stash_arrays(arr);
+            for (const auto& [ptr, bpb] : arr) {
+                const size_t bytes = (size_t) pk.blocks * bpb;
+                pk.host.emplace_back(new uint8_t[bytes]);
+                par_copy(pk.host.back().get(), ptr, bytes);
+                pk.bytes += bytes;
+            }
+            const size_t rows = (size_t) (pk.cells / stash_qs.idx_block + 2);
+            for (int64_t i = 0; i < g.n_qsa_layers(); ++i) {
+                const strata::core::QsaState& st = ss.qsa_states[i];
+                const size_t r = std::min<size_t>(rows, (size_t) st.idx_pooled_rows);
+                pk.pooled.emplace_back(r * (size_t) stash_qs.idx_dim * 4);
+                pk.dead.emplace_back((size_t) stash_qs.idx_dim * 4);
+                pk.bpos.emplace_back(4);
+                cudaMemcpy(pk.pooled.back().data(), st.idx_pooled, pk.pooled.back().size(), cudaMemcpyDefault);
+                cudaMemcpy(pk.dead.back().data(), st.idx_dead, pk.dead.back().size(), cudaMemcpyDefault);
+                cudaMemcpy(pk.bpos.back().data(), st.idx_block_pos, 4, cudaMemcpyDefault);
+                pk.bytes += pk.pooled.back().size();
+            }
+            for (const ConvCheckpoint& c : checks) pk.bytes += c.gdn.size() + c.ple.size() + c.tails.size() + c.ids.size() * 4;
+            pk.checks = std::move(checks);
+            checks.clear();
+            pk.cvec = cvec_cached;
+            pk.used = ++park_clock;
+            pk.id = park_clock;
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata serve: chat cache: parked a conversation of %lld tokens (%zu checkpoints, %.0f MiB) "
+                                 "in %.0f ms\n", (long long) pk.cells, pk.checks.size(), (double) pk.bytes / 1048576.0, ms);
+            // an older copy of the same conversation (all its checkpoints are prefixes of this one's) is superseded
+            const ConvCheckpoint* top = nullptr;
+            for (const ConvCheckpoint& c : pk.checks) if (!top || c.ids.size() > top->ids.size()) top = &c;
+            for (size_t i = 0; i < chat_parked.size();) {
+                bool prefix = !chat_parked[i].checks.empty() && chat_parked[i].cvec == pk.cvec;
+                for (const ConvCheckpoint& c : chat_parked[i].checks)
+                    prefix = prefix && c.ids.size() <= top->ids.size() && c.imgs.size() <= top->imgs.size() &&
+                             std::equal(c.ids.begin(), c.ids.end(), top->ids.begin());
+                if (prefix) {
+                    std::fprintf(stderr, "strata serve: chat cache: dropped an older copy (%lld tokens)\n",
+                                 (long long) chat_parked[i].cells);
+                    chat_parked.erase(chat_parked.begin() + (std::ptrdiff_t) i);
+                } else {
+                    ++i;
+                }
+            }
+            chat_parked.push_back(std::move(pk));
+            // least recently used first, while over the count or the budget (never the one just parked)
+            while (chat_parked.size() > 1 && ((int) chat_parked.size() > o.chat_cache ||
+                                         park_bytes_total() > (size_t) o.chat_cache_mib << 20)) {
+                size_t lru = 0;
+                for (size_t i = 1; i + 1 < chat_parked.size(); ++i) if (chat_parked[i].used < chat_parked[lru].used) lru = i;
+                std::fprintf(stderr, "strata serve: chat cache: dropped a conversation of %lld tokens (%.0f MiB)\n",
+                             (long long) chat_parked[lru].cells, (double) chat_parked[lru].bytes / 1048576.0);
+                chat_parked.erase(chat_parked.begin() + (std::ptrdiff_t) lru);
+            }
+        };
+        // a parked conversation (already taken out of the store) back into the session; the live one must have been
+        // parked or dropped first
+        auto unpark = [&](Parked&& pk) {
+            const auto t0 = Clock::now();
+            cudaDeviceSynchronize();
+            std::vector<std::pair<uint8_t*, size_t>> arr;
+            stash_arrays(arr);
+            for (size_t a = 0; a < arr.size(); ++a) par_copy(arr[a].first, pk.host[a].get(), (size_t) pk.blocks * arr[a].second);
+            for (int64_t q = 0; q < g.n_qsa_layers(); ++q) {
+                const strata::core::QsaState& st = ss.qsa_states[q];
+                cudaMemcpy(st.idx_pooled, pk.pooled[(size_t) q].data(), pk.pooled[(size_t) q].size(), cudaMemcpyDefault);
+                cudaMemcpy(st.idx_dead, pk.dead[(size_t) q].data(), pk.dead[(size_t) q].size(), cudaMemcpyDefault);
+                cudaMemcpy(st.idx_block_pos, pk.bpos[(size_t) q].data(), 4, cudaMemcpyDefault);
+                strata::kernels::kv_stream_reset(st.map, main_cs);   // its VRAM slots hold the other conversation's blocks
+            }
+            cudaDeviceSynchronize();
+            checks = std::move(pk.checks);
+            live_ok = false;
+            live.clear();
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata serve: chat cache: restored a conversation of %lld tokens in %.0f ms\n",
+                         (long long) pk.cells, ms);
+        };
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -12768,11 +12904,41 @@ int main(int argc, char** argv) {
             if (strata::kernels::cvec().loaded()) strata::kernels::cvec_set_enabled(want_cvec);
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+            // ---- --chat-cache: continue a parked conversation, or park this one when the request is another one
+            const bool chat_cache_on = o.chat_cache > 0 && o.prompt_cache > 0 && stash_supported() &&
+                                       !ckpt_pool.on();   // (the pool reuses a parked checkpoint's storage)
+            if (chat_cache_on) {
+                int64_t best = 0;
+                size_t best_i = 0;
+                for (size_t i = 0; i < chat_parked.size(); ++i) {
+                    if (chat_parked[i].cvec != cvec_cached) continue;
+                    for (const ConvCheckpoint& c : chat_parked[i].checks)
+                        if ((int64_t) c.ids.size() > best && starts_with(c.ids, c.imgs)) { best = (int64_t) c.ids.size(); best_i = i; }
+                }
+                const int64_t current = longest_check(checks);
+                if (best > resume + 256) {
+                    // this request continues a parked conversation: swap it in (reading 256 tokens beats a swap)
+                    Parked target = std::move(chat_parked[best_i]);   // out of the store first: parking may evict
+                    chat_parked.erase(chat_parked.begin() + (std::ptrdiff_t) best_i);
+                    park();
+                    unpark(std::move(target));
+                    resume = best;
+                    from_live = false;
+                } else if (!checks.empty() && resume < std::min<int64_t>(4096, current / 4)) {
+                    // another conversation takes the session (a new chat, a document pasted elsewhere, an unrelated
+                    // API request): keep this one.  A request that shares most of it (an edit, a regenerate) does not
+                    // park: the checkpoints it cannot use are simply dropped, as before.  (A resume from `live` always
+                    // covers the longest checkpoint, so a resume here is a checkpoint's - and it went with the rest.)
+                    park();
+                    resume = 0;
+                    from_live = false;
+                }
+            }
             // ---- side stash: keep the cached conversation through an unrelated short request (see --side-stash)
             // (not with STRATA_CKPT_POOL: the pool reuses a checkpoint's storage, the stash would still hold it)
             stash.active = false;
-            if (o.side_stash > 0 && resume == 0 && !checks.empty() && n <= o.side_stash && stash_supported() &&
-                !ckpt_pool.on()) {
+            if (!chat_cache_on && o.side_stash > 0 && resume == 0 && !checks.empty() && n <= o.side_stash &&
+                stash_supported() && !ckpt_pool.on()) {
                 stash.active = true;
                 stash.limit_cells = 0;
                 for (const ConvCheckpoint& c : checks)

@@ -56,6 +56,8 @@
           <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
           <input type="file" id="file" multiple hidden>
+          <button type="button" class="st-btn st-btn--icon" id="chats-btn" title="Chats" aria-label="Chats">
+            <svg class="st-icon"><use href="/web/sprite.svg#i-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
@@ -258,6 +260,19 @@
       <button class="st-btn st-btn--secondary" id="s-reset" type="button">Reset</button>
       <button class="st-btn st-btn--primary" id="s-apply" type="button">Apply</button>
     </div>
+  </div>
+</aside>
+<!-- ============================ Chats drawer ============================ -->
+<aside class="st-drawer" id="chats-drawer" data-open="false" aria-label="Chats" aria-hidden="true">
+  <div class="st-drawer__head"><span class="card-title">Chats</span>
+    <button class="st-btn st-btn--icon" id="chats-close" aria-label="Close">
+      <svg class="st-icon"><use href="/web/sprite.svg#i-chevron"/></svg></button></div>
+  <div class="st-drawer__body">
+    <button class="st-btn st-btn--secondary" id="chats-new" type="button">
+      <svg class="st-icon st-icon--sm"><use href="/web/sprite.svg#i-new-chat"/></svg>New chat</button>
+    <div class="chat-list" id="chat-list"></div>
+    <span class="muted small">Kept in this browser. The server keeps the last few chats ready, so going back to one
+      does not read it again.</span>
   </div>
 </aside>
 <div class="scrim" id="scrim" hidden></div>

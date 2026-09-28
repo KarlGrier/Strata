@@ -14,7 +14,8 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("strata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  set(k, v) { try { localStorage.setItem("strata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },   // private mode or full: in memory only
+  del(k) { try { localStorage.removeItem("strata." + k); } catch (e) { /* ignore */ } },
 };
 
 // ------------------------------------------------------------------ toasts
@@ -572,13 +573,107 @@ function samplingUntouched(s) {
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
+// ---- several chats: an index (id, title, time) and each chat's messages under its own key.  The single chat of
+// earlier versions ("strata.chat") becomes the first entry.
+let chats = store.get("chats", null);
+function newChatId() {                  // unique even for two chats made in the same millisecond (or in two tabs)
+  let id;
+  do id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8); while ((chats || []).some((c) => c.id === id));
+  return id;
+}
+if (!Array.isArray(chats)) {
+  const old = store.get("chat", []);
+  chats = [];
+  if (old.length) {
+    const id = newChatId();
+    chats.push({id, title: chatTitle(old), time: Date.now()});
+    store.set("chat." + id, old);
+  }
+  store.set("chats", chats);
+  store.del("chat");
+}
+let chatId = store.get("current", chats.length ? chats[0].id : null);
+if (!chats.some((c) => c.id === chatId)) chatId = chats.length ? chats[0].id : null;
+let messages = chatId ? store.get("chat." + chatId, []) : [];
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
+let storageWarned = false;
+function chatTitle(msgs) {
+  const first = msgs.find((m) => m.role === "user");
+  const t = first ? (first.text || (first.files && first.files.length ? first.files[0].name : "")) : "";
+  return t.replace(/\s+/g, " ").trim().slice(0, 80) || "New chat";
+}
 function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+  if (!messages.length && !chatId) return;
+  if (!chatId) {                                   // the first message of a new chat
+    chatId = newChatId();
+    chats.unshift({id: chatId, title: "", time: Date.now()});
+  }
+  // attached files keep their text: without it the next turn would send a different history (a full re-read,
+  // and the model would no longer see the file)
+  const ok = store.set("chat." + chatId, messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                                              files: (m.files || []).map((f) => ({name: f.name, text: f.text}))})));
+  const c = chats.find((x) => x.id === chatId);
+  if (c) { c.title = chatTitle(messages); c.time = Date.now(); }
+  chats.sort((a, b) => b.time - a.time);
+  store.set("chats", chats);
+  store.set("current", chatId);
+  if (!ok && !storageWarned) {
+    storageWarned = true;
+    toast("warn", "Browser storage is full", "This chat is kept until the page is reloaded. Delete old chats under Chats.", 8000);
+  }
+}
+function switchChat(id) {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return false; }
+  chatId = id;
+  messages = id ? store.get("chat." + id, []) : [];
+  store.set("current", id);
+  renderChat();
+  renderChatList();
+  return true;
+}
+function renderChatList() {
+  const box = $("chat-list");
+  if (!box) return;
+  box.textContent = "";
+  for (const c of chats) {
+    const row = document.createElement("div");
+    row.className = "chat-row";
+    row.setAttribute("aria-current", String(c.id === chatId));
+    const text = document.createElement("div");
+    text.className = "chat-row__text";
+    const t = document.createElement("span");
+    t.className = "chat-row__title";
+    t.textContent = c.title || "New chat";
+    const when = document.createElement("span");
+    when.className = "muted small";
+    when.textContent = new Date(c.time).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+    text.append(t, when);
+    const del = document.createElement("button");
+    del.type = "button"; del.className = "st-btn st-btn--icon"; del.setAttribute("aria-label", "Delete chat");
+    del.innerHTML = icon("trash", "st-icon st-icon--sm");
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (busy && c.id === chatId) { toast("warn", "Still writing", "Stop the answer first."); return; }
+      const saved = store.get("chat." + c.id, []), at = chats.indexOf(c);
+      chats.splice(at, 1);
+      store.del("chat." + c.id);
+      store.set("chats", chats);
+      if (c.id === chatId) switchChat(chats.length ? chats[0].id : null); else renderChatList();
+      toast("info", "Chat deleted", c.title || "", 6000, {label: "Undo", run: () => {
+        chats.splice(at, 0, c); store.set("chat." + c.id, saved); store.set("chats", chats); renderChatList(); }});
+    };
+    row.append(text, del);
+    row.onclick = () => { if (c.id !== chatId && switchChat(c.id)) openChats(false); };
+    box.appendChild(row);
+  }
+}
+function openChats(open) {
+  $("chats-drawer").dataset.open = String(open);
+  $("chats-drawer").setAttribute("aria-hidden", String(!open));
+  $("scrim").hidden = !open;
+  if (open) renderChatList();
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
@@ -889,15 +984,15 @@ $("input").addEventListener("keydown", (e) => {
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
 
-$("new-btn").onclick = () => {
+function newChat() {
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
   if (!messages.length) return;
-  const backup = messages;
-  messages = [];
-  saveChat();
-  renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
-};
+  switchChat(null);                     // the old chat stays in the list; this one gets its id with its first message
+}
+$("new-btn").onclick = newChat;
+$("chats-new").onclick = () => { newChat(); openChats(false); };
+$("chats-btn").onclick = () => openChats(true);
+$("chats-close").onclick = () => openChats(false);
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
@@ -1084,8 +1179,12 @@ $("s-apply").onclick = async () => {
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
-$("scrim").onclick = () => openDrawer(false);
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
+$("scrim").onclick = () => { openDrawer(false); openChats(false); };
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if ($("drawer").dataset.open === "true") openDrawer(false);
+  if ($("chats-drawer").dataset.open === "true") openChats(false);
+});
 
 // ------------------------------------------------------------------ start
 setBusy(false);

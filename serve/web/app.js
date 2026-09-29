@@ -624,12 +624,17 @@ function chatTitle(msgs) {
   const t = first ? (first.text || (first.files && first.files.length ? first.files[0].name : "")) : "";
   return t.replace(/\s+/g, " ").trim().slice(0, 80) || "New chat";
 }
+// The list lives in browser storage, which every tab of the page shares: re-read it before each change, so a chat
+// another tab added (or deleted) is not undone by this tab writing back its own older copy of the list.
+function syncChats() {
+  const stored = store.get("chats", null);
+  if (Array.isArray(stored)) chats = stored;
+}
 function saveChat() {
   if (!messages.length && !chatId) return;
-  if (!chatId) {                                   // the first message of a new chat
-    chatId = newChatId();
-    chats.unshift({id: chatId, title: "", time: Date.now()});
-  }
+  syncChats();
+  if (!chatId) chatId = newChatId();               // the first message of a new chat
+  if (!chats.some((x) => x.id === chatId)) chats.unshift({id: chatId, title: "", time: Date.now()});
   // attached files keep their text: without it the next turn would send a different history (a full re-read,
   // and the model would no longer see the file)
   const ok = store.set("chat." + chatId, messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
@@ -676,24 +681,33 @@ function renderChatList() {
     del.onclick = (e) => {
       e.stopPropagation();
       if (busy && c.id === chatId) { toast("warn", "Still writing", "Stop the answer first."); return; }
-      const saved = store.get("chat." + c.id, []), at = chats.indexOf(c);
-      chats.splice(at, 1);
+      syncChats();
+      const saved = store.get("chat." + c.id, []);
+      chats = chats.filter((x) => x.id !== c.id);
       store.del("chat." + c.id);
       store.set("chats", chats);
       if (c.id === chatId) switchChat(chats.length ? chats[0].id : null); else renderChatList();
       toast("info", "Chat deleted", c.title || "", 6000, {label: "Undo", run: () => {
-        chats.splice(at, 0, c); store.set("chat." + c.id, saved); store.set("chats", chats); renderChatList(); }});
+        syncChats();
+        if (!chats.some((x) => x.id === c.id)) { chats.push(c); chats.sort((a, b) => b.time - a.time); }
+        store.set("chat." + c.id, saved); store.set("chats", chats); renderChatList(); }});
     };
     row.append(text, del);
     row.onclick = () => { if (c.id !== chatId && switchChat(c.id)) openChats(false); };
     box.appendChild(row);
   }
 }
+// another tab changed the list: show it (this tab's own chat stays open; its next save puts it back if it was deleted there)
+window.addEventListener("storage", (e) => {
+  if (e.key !== "strata.chats") return;
+  syncChats();
+  if ($("chats-drawer").dataset.open === "true") renderChatList();
+});
 function openChats(open) {
   $("chats-drawer").dataset.open = String(open);
   $("chats-drawer").setAttribute("aria-hidden", String(!open));
   $("scrim").hidden = !open;
-  if (open) renderChatList();
+  if (open) { syncChats(); renderChatList(); }
 }
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 

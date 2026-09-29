@@ -57,13 +57,16 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
           <input type="file" id="file" multiple hidden>
           <button type="button" class="st-btn st-btn--icon" id="chats-btn" title="Chats" aria-label="Chats">
-            <svg class="st-icon"><use href="/web/sprite.svg#i-chat"/></svg></button>
+            <svg class="st-icon"><use href="web/sprite.svg#i-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
             <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
+          <button type="button" class="st-btn st-btn--secondary web-toggle" id="web-btn" aria-pressed="false" hidden
+            title="Web search: the model may search the web and read pages while it answers (read-only; cites the URLs it used)">
+            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-globe"/></svg>Web search</button>
           <span class="spacer"></span>
           <span class="composer-hint" id="composer-hint"></span>
           <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
@@ -266,10 +269,10 @@
 <aside class="st-drawer" id="chats-drawer" data-open="false" aria-label="Chats" aria-hidden="true">
   <div class="st-drawer__head"><span class="card-title">Chats</span>
     <button class="st-btn st-btn--icon" id="chats-close" aria-label="Close">
-      <svg class="st-icon"><use href="/web/sprite.svg#i-chevron"/></svg></button></div>
+      <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button></div>
   <div class="st-drawer__body">
     <button class="st-btn st-btn--secondary" id="chats-new" type="button">
-      <svg class="st-icon st-icon--sm"><use href="/web/sprite.svg#i-new-chat"/></svg>New chat</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-new-chat"/></svg>New chat</button>
     <div class="chat-list" id="chat-list"></div>
     <span class="muted small">Kept in this browser. The server keeps the last few chats ready, so going back to one
       does not read it again.</span>

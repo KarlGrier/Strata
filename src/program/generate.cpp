@@ -11395,9 +11395,16 @@ int main(int argc, char** argv) {
                     // another conversation takes the session (a new chat, a document pasted elsewhere, an unrelated
                     // API request): keep this one.  A request that shares most of it (an edit, a regenerate) does not
                     // park: the checkpoints it cannot use are simply dropped, as before.  (A resume from `live` always
-                    // covers the longest checkpoint, so a resume here is a checkpoint's - and it went with the rest.)
+                    // covers the longest checkpoint, so a resume here is a checkpoint's.)  That checkpoint - in practice
+                    // the root at the end of a shared system prompt (--prompt-cache-root) - stays with the session as a
+                    // copy: parking only copies the cells below it, so the session still holds them.
+                    std::vector<ConvCheckpoint> keep;
+                    if (resume > 0 && !from_live)
+                        for (const ConvCheckpoint& c : checks)
+                            if ((int64_t) c.ids.size() == resume) { keep.push_back(c); break; }
                     park();
-                    resume = 0;
+                    if (keep.empty()) resume = 0;
+                    else checks = std::move(keep);
                     from_live = false;
                 }
             }

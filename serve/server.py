@@ -86,6 +86,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import websearch  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -4079,6 +4080,7 @@ class Service:
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
+        self.web = None                                  # serve/websearch.py's settings when "web_search" is configured
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
@@ -7116,6 +7118,11 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._config_get()
                 return
+            if path == "/web":
+                # web search (websearch.py): configured? SearXNG reachable? (the web app's switch)
+                if self._authorized():
+                    self._json(200, websearch.status(svc.web))
+                return
             if path == "/mcp":
                 # the MCP servers, their state and tools (the web app's switch and Monitor card)
                 if self._authorized():
@@ -7641,7 +7648,7 @@ def make_handler(svc: Service):
                 tools = None
             force = svc.force_text(forced_call(req.get("tool_choice"), tools))      # a bad value is a 400 before anything is sent
             messages, validator = prepare_format(req.get("response_format"), messages)
-            if validator is not None and (tools or req.get("strata_mcp")):
+            if validator is not None and (tools or req.get("strata_mcp") or req.get("strata_web")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
@@ -7666,15 +7673,21 @@ def make_handler(svc: Service):
                                      f"(0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
+            use_web = req.get("strata_web") is True and svc.web is not None      # its "Web search" switch (websearch.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
-            if use_mcp:
-                if not self._own_page("MCP tools can be used"):   # tools run with the user's rights on this PC
+            hub, extra = None, []
+            if use_mcp or use_web:
+                if not self._own_page("tools can be used"):       # tools run on this PC: the app's own page only
                     return
-                svc.mcp.wait(10)                                  # servers still starting (only right after start)
-                extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
-                use_mcp = bool(extra)
+                if use_web:                                       # one hub per request: its fetch allow-list
+                    web = websearch.WebHub(svc.web, messages)
+                    hub = websearch.CombinedHub(web, svc.mcp) if use_mcp else web
+                else:
+                    hub = svc.mcp
+                hub.wait(10)                                      # MCP servers still starting (right after start)
+                extra = hub.template_tools(exclude=own)           # the request's own tools win a name clash
                 tools = (tools or []) + extra or None
-            if force and use_mcp:
+            if force and extra:                               # round 14: use_mcp no longer means "has MCP tools" (web search)
                 raise ValueError("a forced tool_choice with MCP tools is not supported")
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -7683,8 +7696,8 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
-            run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+            run = run_with_mcp(svc, hub, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                               {t["name"] for t in extra}) if extra else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -8932,6 +8945,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    # the web app's web search (local): never with --offline (it reads the network)
+    web_cfg = None if a.offline else websearch.config_from(cfg)
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -9220,6 +9235,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    if web_cfg is not None:
+        svc.web = web_cfg
+        print(f"[strata] web search for the web app's chat: {websearch.status(web_cfg)}", flush=True)
     if hub is not None:
         import atexit
         svc.mcp = hub

@@ -689,6 +689,36 @@ $("cfg-save").addEventListener("click", async () => {
   }
 });
 
+// ------------------------------------------------------------------ Web search (GET /web, serve/websearch.py)
+// The switch shows only when the server has web search configured; on, each message lets the model call web_search
+// and fetch_page (the server runs them). Toggling it changes the tool list at the start of the prompt, so the first
+// message after a toggle reads the chat again.
+let webInfo = {enabled: false};
+async function loadWeb() {
+  try {
+    const r = await fetch("web", {headers: headers()});
+    if (r.ok) webInfo = await r.json();
+  } catch (e) { webInfo = {enabled: false}; }
+  renderWeb();
+}
+function renderWeb() {
+  const b = $("web-btn");
+  b.hidden = !webInfo.enabled;
+  b.setAttribute("aria-pressed", String(!!settings.web));
+  b.dataset.down = String(!!webInfo.enabled && webInfo.reachable === false);
+  b.title = webInfo.reachable === false
+    ? "Web search: the search service (SearXNG) does not answer - start it (see REPORT.md, Round 5)"
+    : "Web search: the model may search the web and read pages while it answers (read-only; cites the URLs it used)";
+}
+$("web-btn").onclick = () => {
+  settings = {...settings, web: !settings.web};
+  store.set("sampling", settings);
+  renderWeb();
+  toast("info", settings.web ? "Web search on" : "Web search off",
+        settings.web ? "The model may search the web and read pages; it cites the URLs it used." : "", 3000);
+  if (settings.web) loadWeb();
+};
+
 // ------------------------------------------------------------------ Markdown (escaped first, then formatted)
 function inline(s) {
   const codes = [];
@@ -787,7 +817,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true, math: false,
-                  chatList: false, chatEdit: false, whileBusy: "wait"};
+                  chatList: false, chatEdit: false, whileBusy: "wait", web: false};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -1223,6 +1253,7 @@ async function generateReply() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (settings.web && webInfo.enabled) body.strata_web = true;              // the Web search switch (serve/websearch.py)
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -1511,7 +1542,7 @@ $("s-apply").onclick = async () => {
               top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
               math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
               chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
-              whileBusy: segValue("s-busy") || "wait"};
+              whileBusy: segValue("s-busy") || "wait", web: !!settings.web};
   store.set("sampling", settings);
   StrataMath.reset();                                  // math on or off: every answer is drawn again
   if (settings.chatList !== !!prev.chatList) await setChatList(settings.chatList, true);
@@ -1571,7 +1602,7 @@ async function start() {
   renderChat();
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-  loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  loadHealth().then(loadMcp).then(loadWeb).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
   showTab(location.hash.slice(1) || "chat");
   poll();
   requestAnimationFrame(fitHeader);

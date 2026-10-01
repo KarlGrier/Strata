@@ -16880,7 +16880,9 @@ int main(int argc, char** argv) {
                         // a probabilistic window must not condition the source on the draw: the policy copy fixed at the request's start
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && mtp.prob();
-                        if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                        // exact speculative sampling: the draft head's raw argmax (before its draw), never the sampled draft - the choice
+                        // of q for position 1 must not depend on that position's own draw
+                        if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == (mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                             if (pk.lookup) { T = pk.t; from_sfx = true; }
@@ -17093,6 +17095,11 @@ int main(int argc, char** argv) {
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                // exact speculative sampling (STRATA_SPEC_EXACT=1, a sampled request): the drafter's rows verify with
+                // their q lists, a lookup window's drafts as point masses (core/spec_exact.hpp); no drafter: none;
+                // not on a merged first window either (STRATA_ADMIT_MERGE_FIRST: prompt tokens, no drafts)
+                ver.set_spec_window(use_mtp && mtp.ess() && !first_window, from_sfx || !use_mtp ? nullptr : mtp.ess_qlists(),
+                                    from_sfx || !use_mtp ? 0 : T - 1);
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -18714,7 +18721,9 @@ int main(int argc, char** argv) {
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the
                 // lookup is taken without asking whether the MTP's first guess agrees
                 const bool probabilistic = use_mtp && mtp.prob();
-                if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                // exact speculative sampling: the draft head's raw argmax (before its draw), never the sampled draft - the choice
+                // of q for position 1 must not depend on that position's own draw
+                if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == (mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                     const strata::spec::DraftPolicy::Pick pk = probabilistic
                         ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
@@ -18767,6 +18776,8 @@ int main(int argc, char** argv) {
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
             else if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            ver.set_spec_window(use_mtp && mtp.ess(), from_sfx || !use_mtp ? nullptr : mtp.ess_qlists(),
+                                from_sfx || !use_mtp ? 0 : T - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
             if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs

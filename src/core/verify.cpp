@@ -3384,9 +3384,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        // STRATA_SPEC_PROB: the drafter's q lists for this window, judged by rejection sampling (spec_prob.hpp)
         bool judged = false;
-        if (sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= kVerifyMaxT) {
+        if (ess_on_ && sampled && T > 1) {   // exact speculative sampling: drafts = the window's tokens 1 .. T-1 (mapped)
+            sample_tokens_spec(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_tok_ + 1, ess_q_,
+                               std::min(ess_nmtp_, T - 1), T - 1, m_out_, cs_);
+            judged = true;
+        } else if (sampled && (measure || (spec_q_ != nullptr && spec_nq_ > 0 && T > 1)) && T <= kVerifyMaxT) {
             if (d_spec_ == nullptr &&
                 cudaMalloc((void**) &d_spec_, (size_t) kVerifyMaxT * (1 + strata::core::kSpecQStride) * sizeof(int32_t)) !=
                     cudaSuccess) {

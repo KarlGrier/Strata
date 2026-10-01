@@ -83,6 +83,34 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
 bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
+// ---- EXACT SPECULATIVE SAMPLING (include/strata/core/spec_exact.hpp, STRATA_SPEC_EXACT=1).  The drafter SAMPLES its draft
+// from its own chain's final distribution q with a PROPOSAL stream of its own, and writes q as an exact integer list;
+// the verify head then accepts a draft x with probability min(1, p(x) / q(x)) (ACCEPTANCE stream), samples a
+// rejected row from normalize((p - q)+) (RESIDUAL stream), and samples a row without a draft (the bonus) exactly as
+// `sample_tokens` does (the request's own stream, the same uniform: such a row is today's pick).  p and q are the
+// exact distributions the sampler's inverse-CDF draws from: kEssScale-th parts (`bucket counts` of the 24-bit draw).
+inline constexpr int kEssMaxList = 64;
+inline constexpr int32_t kEssScale = 1 << 24;   // the 24-bit uniform's grid: every distribution is cnt / 2^24
+struct EssQList {
+    int32_t n;                    // entries (0: no list - a point-mass draft)
+    int32_t id[kEssMaxList];      // token ids
+    int32_t cnt[kEssMaxList];     // q(id) * 2^24, exactly; the counts sum to 2^24
+};
+// The drafter's step j with exact sampling: the chain of `coupled_draft_sample` (penalties from the ring, the request's
+// top_k / top_p / min_p / temperature over the draft head's `nv` logits), then the draw with the PROPOSAL stream at
+// counter coupled_draft_counter(step_rec[0]); writes the draft's token id to *out_id (and ring[cap + j]), q to *qlist,
+// and maps `top_sub` (the greedy argmax's subset index, computed before the penalties) to its token id in *top_id.
+void ess_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                      const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec, void* scratch,
+                      const int32_t* top_sub, int32_t* top_id, int32_t* out_id, EssQList* qlist, void* stream);
+// The verify head with exact sampling: rows 0 .. n_drafts-1 verify `drafts[t]` (device; the window's token t + 1),
+// row t's q = qlists[t] for t < n_mtp (the drafter's), a point mass at drafts[t] for n_mtp <= t < n_drafts (a lookup
+// draft); rows n_drafts .. n_tokens-1 are sampled as `sample_tokens` samples them.  `out[t]` = the row's token: the
+// draft when accepted, else a residual draw (never the draft), so the caller's accept rule (drafts[t] == out[t]) is
+// unchanged.  `p.counter` = the window's pos0 (row t draws at pos0 + t in every stream).
+void sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* drafts, const EssQList* qlists, int n_mtp, int n_drafts,
+                        int* out, void* stream);
 
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.

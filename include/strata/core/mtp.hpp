@@ -123,6 +123,13 @@ public:
     /// valid on the host once draft() has returned.  False for greedy requests and where the mode is off.
     bool prob() const { return coupled_active_ && h_q_ != nullptr; }
     const int32_t* spec_q() const { return h_q_; }
+    /// EXACT SPECULATIVE SAMPLING (core/spec_exact.hpp; STRATA_SPEC_EXACT=1, set up by bind()): a sampled request then
+    /// drafts by SAMPLING from its own chain with a proposal stream of its own, `probs` stays the gate value (the draft
+    /// head's raw top probability, before the draw), and each step's q goes to `ess_qlists()[j]` (device) for the
+    /// verify head.  `ess_top(j)`: step j's raw argmax token (before the draw: the lookup check compares with it).
+    bool ess() const { return coupled_active_ && ess_; }
+    const strata::kernels::EssQList* ess_qlists() const { return qlists_; }
+    int32_t ess_top(int j) const { return ((volatile const int32_t*) h_top_)[j]; }
 
     // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
     // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
@@ -187,6 +194,10 @@ private:
     cudaGraphExec_t round_exec_c_[9] = {};
     cudaGraphExec_t step_exec_c_[9] = {};
     bool coupled_ok_ = false, coupled_active_ = false;
+    bool ess_ = false;                                          ///< exact speculative sampling (spec_exact.hpp)
+    strata::kernels::EssQList* qlists_ = nullptr;               ///< device: step j's q list
+    int32_t* top_sub_ = nullptr;                                ///< device: the step's raw argmax (subset index)
+    int32_t *h_top_ = nullptr, *m_top_ = nullptr;               ///< mapped: step j's raw argmax token
     bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
     int coupled_j_ = 0;
     strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;

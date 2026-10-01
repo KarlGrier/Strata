@@ -162,6 +162,14 @@ public:
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
     void set_head_sampling(bool on) { head_sampling_ = on; if (next_) next_->set_head_sampling(on); }
+    /// EXACT SPECULATIVE SAMPLING (core/spec_exact.hpp): the NEXT window's drafts are verified by accept / residual /
+    /// bonus (`strata::kernels::sample_tokens_spec`) instead of sample-and-match, for a sampled request.  Rows
+    /// 0 .. n_mtp-1 verify the drafter's drafts with q = qlists[t] (device, the head's device); the window's later
+    /// drafts (a lookup window: n_mtp = 0) are point masses.  `on` = false: sample-and-match.  Set before each run().
+    void set_spec_window(bool on, const strata::kernels::EssQList* qlists, int n_mtp) {
+        ess_on_ = on; ess_q_ = qlists; ess_nmtp_ = n_mtp;
+        if (next_) next_->set_spec_window(on, qlists, n_mtp);
+    }
 
     /// LAYER SPLIT (multi-GPU): this verifier runs layers [layer_begin, layer_end) of every window.  A stage that
     /// does not start at layer 0 takes its residual from `handoff_in` instead of embedding the tokens; a stage that
@@ -449,6 +457,9 @@ private:
 #endif
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    bool ess_on_ = false;                ///< set_spec_window: the next window verifies by exact speculative sampling
+    const strata::kernels::EssQList* ess_q_ = nullptr;
+    int ess_nmtp_ = 0;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT's counters on device_ (#1578); null: none
     std::atomic<bool> released_{false};  ///< #267: release_gpu_waits ran (maybe on the watchdog thread): no more windows

@@ -2,6 +2,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/core/spec_exact.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
 
@@ -148,6 +149,9 @@ MtpDrafter::~MtpDrafter() {
     if (h_cparams_) cudaFreeHost(h_cparams_);
     if (h_chist_) cudaFreeHost(h_chist_);
     if (h_q_) cudaFreeHost(h_q_);
+    if (qlists_) cudaFree(qlists_);
+    if (top_sub_) cudaFree(top_sub_);
+    if (h_top_) cudaFreeHost(h_top_);
     if (cs_) cudaStreamDestroy(cs_);
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
@@ -548,8 +552,11 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
     // the split scratch (64 lists of 64 entries at most) and the parameters
-    if (coupled_draft_env() && cparams_ == nullptr)
+    if ((coupled_draft_env() || spec_exact_env()) && cparams_ == nullptr)
         bytes += (uint64_t) n_vocab * 4 + (uint64_t) (kCoupledHistCap + max_t_) * 4 + 64ull * 64ull * 8ull + 4096;
+    // exact speculative sampling: the q lists (one per draft step) and the argmax scratch
+    if (spec_exact_env() && qlists_ == nullptr)
+        bytes += (uint64_t) max_t_ * sizeof(strata::kernels::EssQList) + 256;
     return bytes;
 }
 
@@ -569,7 +576,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         err = "mtp: the coupled draft sampler's buffers do not fit";
         return false;
     }
-    if (spec_prob_env() &&
+    if (spec_prob_env() && !spec_exact_env() &&   // round 15: our exact sampling (STRATA_SPEC_EXACT) wins when both are set
         !mapped((size_t) max_t_ * (size_t) kSpecQStride * sizeof(int32_t), (void**) &h_q_, (void**) &m_q_)) {
         err = "mtp: the draft distributions' buffer does not fit";
         return false;
@@ -594,13 +601,30 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         return false;
     }
     coupled_ok_ = true;
+    if (spec_exact_env()) {   // exact speculative sampling: the same chain and ring, a draw and a q list of its own
+        if (cudaMalloc((void**) &qlists_, (size_t) max_t_ * sizeof(strata::kernels::EssQList)) != cudaSuccess ||
+            cudaMalloc((void**) &top_sub_, sizeof(int32_t)) != cudaSuccess ||
+            !mapped((size_t) max_t_ * sizeof(int32_t), (void**) &h_top_, (void**) &m_top_)) {
+            err = "mtp: the exact sampler's q lists do not fit";
+            return false;
+        }
+        cudaMemset(qlists_, 0, (size_t) max_t_ * sizeof(strata::kernels::EssQList));
+        std::fill(h_top_, h_top_ + max_t_, -1);
+        vram_ += (uint64_t) max_t_ * sizeof(strata::kernels::EssQList) + sizeof(int32_t);
+        ess_ = true;
+        std::fprintf(stderr, "strata mtp: EXACT speculative sampling on (STRATA_SPEC_EXACT): sampled requests draft from "
+                             "q (their own chain over %lld tokens, a proposal stream of its own) and verify by accept / "
+                             "residual / bonus%s\n", (long long) nv,
+                     spec_prob_env() ? "; STRATA_SPEC_PROB is ignored beside it" : "");
+        return true;
+    }
     if (spec_prob_env())
         std::fprintf(stderr, "strata mtp: probabilistic draft acceptance on (STRATA_SPEC_PROB): sampled requests draft by "
                              "sampling the draft head's distribution over %lld tokens; the verifier accepts with "
                              "min(1, p/q) and resamples the residual\n", (long long) nv);
     else
         std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
-                             "target's chain and Philox draw over %lld tokens\n", (long long) nv);
+                         "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
 }
 
@@ -741,7 +765,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                                                   "MTP draft head");
         }
     }
-    if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
+    if ((coupled_draft_env() || spec_exact_env()) && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
 }
 
@@ -1191,6 +1215,19 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
                     (int) nv, T, cs);
         g_mp.stamp(14, cs);
+        if (coupled_rec_ && ess_) {
+            // exact speculative sampling: the gate first - the raw argmax and its probability (today's draft and
+            // dprob, from the logits before any draw) - then the request's chain, the proposal draw and q's list
+            SamplerParams gp;
+            gp.greedy = true;
+            gp.temperature = 0.0f;
+            sample_tokens(head_logits_, 1, (int) nv, nullptr, 0, gp, top_sub_, cs);
+            row_top_prob(head_logits_, 1, (int) nv, top_sub_, probs_, cs);
+            ess_draft_sample(head_logits_, (int) nv, sub ? dvocab_ : nullptr, sub ? dinv_ : nullptr, (int) n_vocab_,
+                             cparams_, cring_, kCoupledHistCap, coupled_j_, step, cscratch_, top_sub_, m_top_ + coupled_j_,
+                             out_ids_, qlists_ + coupled_j_, cs);
+            return true;
+        }
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)

@@ -12864,7 +12864,9 @@ int main(int argc, char** argv) {
                 if (o.suffix_draft > 0 && !first_window) {
                     const int k = sfx.propose(S - 1, sbuf.data());
                     sfx_match = sfx.last_match();
-                    if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                    // exact speculative sampling: the draft head's raw argmax (before its draw), never the sampled
+                    // draft - the choice of q for position 1 must not depend on that position's own draw
+                    if (k > 0 && (!use_mtp || sbuf[0] == (mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                         const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                         if (pk.lookup) { T = pk.t; from_sfx = true; }
                     }
@@ -12944,6 +12946,10 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                // exact speculative sampling (STRATA_SPEC_EXACT=1, a sampled request): the drafter's rows verify with
+                // their q lists, a lookup window's drafts as point masses (core/spec_exact.hpp); no drafter: none
+                ver.set_spec_window(use_mtp && mtp.ess(), from_sfx || !use_mtp ? nullptr : mtp.ess_qlists(),
+                                    from_sfx || !use_mtp ? 0 : T - 1);
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -14065,7 +14071,7 @@ int main(int argc, char** argv) {
             if (o.suffix_draft > 0 && !first_window) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
-                if (k > 0 && (!use_mtp || sbuf[0] == drafts[0])) {
+                if (k > 0 && (!use_mtp || sbuf[0] == (mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
                 }
@@ -14115,6 +14121,8 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            ver.set_spec_window(use_mtp && mtp.ess(), from_sfx || !use_mtp ? nullptr : mtp.ess_qlists(),
+                                from_sfx || !use_mtp ? 0 : T - 1);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;

@@ -15148,7 +15148,20 @@ int main(int argc, char** argv) {
                 // (--adapt-async 1: the asynchronous tier above instead, ticked before the window)
                 if (!drive.d.usage.empty() && !ajob && ((rounds + 1) % o.adapt_every) == 0)
                     adapt_thr = std::thread([&] { strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
-                if (!ver.commit(a + 1, err)) {
+                // the outputs this window hands out: up to max_new, through the first end of turn.  Only their
+                // positions are committed, so the session holds exactly what the client saw (a follow-up that sends
+                // the answer back resumes from it); an accepted draft past them would be in no prompt.
+                // (upstream PR #652, round 11 transplant; STRATA_COMMIT_ALL=1 = the old behaviour: all a + 1)
+                static const bool commit_all = std::getenv("STRATA_COMMIT_ALL") != nullptr;
+                // (a merged first window - STRATA_ADMIT_MERGE_FIRST - holds prompt tokens: all of them are committed;
+                // only its row T-1 is an output, and that one is next x, never committed)
+                int emit = a + 1;
+                if (!commit_all && !merged) {
+                    emit = 0;
+                    for (bool end = false; emit <= a && produced_n + emit < max_new && !end; ++emit)
+                        end = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) emit]) != o.eos_ids.end();
+                }
+                if (!ver.commit(emit, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
@@ -15168,8 +15181,8 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                // the window's first `emit` tokens are in the session now (the last output is not: it is next x)
+                for (int i = 0; i < emit; ++i) consumed.push_back(window[(size_t) i]);
                 if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
                     draft_offered += T - 1;
                     draft_accepted += a;

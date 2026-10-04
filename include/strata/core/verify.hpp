@@ -507,6 +507,11 @@ private:
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    // round 11 A.2 (STRATA_ROUTER_Q8K=1): the doorbell also writes ggml's Q8_K rows of the FFN input (T rows of
+    // n_embd / 256 blocks of 292 bytes) for the CPU pool; one device counter per token group for the last block's ring
+    uint8_t* h_xk_ = nullptr;    uint8_t* m_xk_ = nullptr;
+    int64_t xk_stride_ = 0;
+    unsigned* q8k_ctr_ = nullptr;
 
     // device
     void* arena_ = nullptr;

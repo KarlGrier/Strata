@@ -26,6 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -331,7 +332,16 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    /// Round 11 A.2 (STRATA_ROUTER_Q8K=1; the idea of fork Eddoursul d9ce223): this token group's activations as the
+    /// window's doorbell wrote them (mapped memory): ggml's Q8_K rows, `xk_stride` bytes apart, which the pool takes
+    /// for a layer whose gate/up activation is Q8_K (`pool_takes_q8k`) instead of quantizing the floats; null = off.
+    const uint8_t* xk = nullptr;
+    int64_t xk_stride = 0;
 };
+
+/// Round 11 A.2: whether the pool takes a native layer's gate/up activation as the doorbell's Q8_K rows (the
+/// i-quants' and K-quants' vec_dot_type; not the Q2_0 kernels' own activation).
+inline bool pool_takes_q8k(const strata::kernels::cpu::NativeFmt& f) { return f.gu_type != 42 && f.gu_act == 15; }
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;

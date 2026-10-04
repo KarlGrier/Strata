@@ -5055,7 +5055,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
-    if (any_cpu) {
+    // round 11 A.2 (STRATA_ROUTER_Q8K=1): the doorbell wrote this layer's Q8_K rows - the same bytes ggml would write
+    const uint8_t* xk = (native && d.plan != nullptr && d.plan->xk != nullptr && pool_takes_q8k(lay.fmt[(size_t) d.layers]))
+                            ? d.plan->xk : nullptr;
+    if (any_cpu && xk == nullptr) {
         // #578 --remote-expert-opt: a token whose experts all run on a GPU (CUDA0 or a helper) needs no CPU activation
         const bool ep = d.remote_count > 0 && d.remote[0]->optimized_decode();
         for (int64_t t = 0; t < n_tok; ++t) {
@@ -5184,7 +5187,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
-            jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+            jb.nact[jb.nt] = xk != nullptr ? xk + (size_t) t * (size_t) d.plan->xk_stride
+                           : native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
             ++jb.nt;
             ++d.multi_entries;

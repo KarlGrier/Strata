@@ -864,6 +864,20 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
+    // round 11 A.2: the Q8_K rows for the pool, when every layer's gate/up activation is Q8_K (a native IQ / K pack)
+    if (ok && [] { const char* v = std::getenv("STRATA_ROUTER_Q8K"); return v != nullptr && std::atoi(v) != 0; }()) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        bool all = lay.native && N % 256 == 0 && !lay.fmt.empty();
+        for (const auto& f : lay.fmt) all = all && pool_takes_q8k(f);
+        if (all) {
+            xk_stride_ = (int64_t) (N / 256) * 292;
+            ok = mapped(T * (uint64_t) xk_stride_, (void**) &h_xk_, (void**) &m_xk_) &&
+                 cudaMalloc((void**) &q8k_ctr_, 256) == cudaSuccess && cudaMemset(q8k_ctr_, 0, 256) == cudaSuccess;
+            if (ok) std::fprintf(stderr, "strata verify: the doorbell writes the CPU pool's Q8_K rows (STRATA_ROUTER_Q8K)\n");
+        } else {
+            std::fprintf(stderr, "strata verify: STRATA_ROUTER_Q8K ignored (a layer's gate/up activation is not Q8_K)\n");
+        }
+    }
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
@@ -2110,6 +2124,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
+            if (m_xk_ != nullptr)   // round 11 A.2: + the pool's Q8_K rows, rung by the last block
+                doorbell_publish_q8k(xm, ids_ + tb * K, w_ + tb * K, (int) n, (int) N, (int64_t) K, m_x_ + tb * N,
+                                     m_ids_ + tb * K, m_w_ + tb * K, m_xk_ + (size_t) tb * (size_t) xk_stride_,
+                                     q8k_ctr_ + 16 * (grp < 2 ? grp : 1), m_seq_, cs);
+            else
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,
@@ -3243,6 +3262,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        sink_.xk = h_xk_ != nullptr ? h_xk_ + (size_t) tb * (size_t) xk_stride_ : nullptr;   // round 11 A.2
+        sink_.xk_stride = xk_stride_;
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)

@@ -390,6 +390,107 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     check_launch("doorbell_publish_res");
 }
 
+// ---- round 11: the doorbell with ggml's Q8_K rows (see elementwise.hpp)
+namespace {
+constexpr int kQK = 256, kQ8KBytes = 4 + kQK + kQK / 16 * 2;   // float d, int8 qs[256], int16 bsums[16] = 292
+
+// one 256-value superblock per block of 256 threads: ggml's quantize_row_q8_K_ref, bit for bit, staged in shared
+// memory (`blk`, 292 bytes + pad) and returned for the caller to store
+__device__ __forceinline__ void q8k_block(float v, uint32_t* blk) {
+    __shared__ float s_amax[8];
+    __shared__ int s_idx[8];
+    __shared__ float s_max;
+    __shared__ int s_zero;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    float a = fabsf(v);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    if (lane == 0) s_amax[warp] = a;
+    __syncthreads();
+    float amax = s_amax[0];
+    for (int w = 1; w < 8; ++w) amax = fmaxf(amax, s_amax[w]);
+    // the FIRST index whose |x| is the largest (ggml: `if (ax > amax)`), its signed value is `max`
+    int idx = fabsf(v) == amax ? t : kQK;
+    for (int o = 16; o > 0; o >>= 1) idx = min(idx, __shfl_xor_sync(0xffffffffu, idx, o));
+    if (lane == 0) s_idx[warp] = idx;
+    __syncthreads();
+    if (t == 0) s_zero = !(amax > 0.0f);
+    __syncthreads();
+    int first = s_idx[0];
+    for (int w = 1; w < 8; ++w) first = min(first, s_idx[w]);
+    if (t == first) s_max = v;
+    __syncthreads();
+    uint8_t* b = reinterpret_cast<uint8_t*>(blk);
+    int q = 0;
+    float d = 0.0f;
+    if (!s_zero) {
+        const float iscale = __fdiv_rn(-127.0f, s_max);
+        q = __float2int_rn(__fmul_rn(iscale, v));
+        q = min(127, q);
+        d = __fdiv_rn(1.0f, iscale);
+    }
+    b[4 + t] = (uint8_t) (int8_t) q;
+    int s16 = q;   // groups of 16 lanes: exact int sums
+    for (int o = 8; o > 0; o >>= 1) s16 += __shfl_xor_sync(0xffffffffu, s16, o);
+    if ((t & 15) == 0) {
+        const int16_t bs = (int16_t) s16;
+        memcpy(b + 4 + kQK + (t / 16) * 2, &bs, 2);
+    }
+    if (t == 0) memcpy(b, &d, 4);
+    __syncthreads();
+}
+
+__global__ void __launch_bounds__(256) doorbell_q8k_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
+                                                           const float* __restrict__ w, int n_embd, int nk, float* x_out,
+                                                           int32_t* ids_out, float* w_out, uint8_t* xk_out,
+                                                           unsigned* ctr, uint32_t* seq) {
+    __shared__ uint32_t blk[(kQ8KBytes + 3) / 4];
+    const int nsb = n_embd / kQK;
+    const int tok = blockIdx.x / nsb, sb = blockIdx.x - tok * nsb;
+    const size_t off = (size_t) tok * n_embd + (size_t) sb * kQK;
+    const float v = x[off + threadIdx.x];
+    x_out[off + threadIdx.x] = v;
+    if (blockIdx.x == 0 && (int) threadIdx.x < nk) { ids_out[threadIdx.x] = ids[threadIdx.x]; w_out[threadIdx.x] = w[threadIdx.x]; }
+    q8k_block(v, blk);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(xk_out + ((size_t) tok * nsb + sb) * kQ8KBytes);
+    if (threadIdx.x < kQ8KBytes / 4) dst[threadIdx.x] = blk[threadIdx.x];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned prev = atomicInc(ctr, gridDim.x - 1u);   // the last block wraps the counter back to 0
+        if (prev == gridDim.x - 1u) {
+            __threadfence_system();
+            *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) q8k_rows_kernel(const float* __restrict__ x, int n_embd, uint8_t* out) {
+    __shared__ uint32_t blk[(kQ8KBytes + 3) / 4];
+    const int nsb = n_embd / kQK;
+    const int tok = blockIdx.x / nsb, sb = blockIdx.x - tok * nsb;
+    q8k_block(x[(size_t) tok * n_embd + (size_t) sb * kQK + threadIdx.x], blk);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(out + ((size_t) tok * nsb + sb) * kQ8KBytes);
+    if (threadIdx.x < kQ8KBytes / 4) dst[threadIdx.x] = blk[threadIdx.x];
+}
+}  // namespace
+
+void doorbell_publish_q8k(const float* x, const int32_t* ids, const float* weights, int n_tok, int n_embd, int64_t k,
+                          float* x_out, int32_t* ids_out, float* weights_out, uint8_t* xk_out, unsigned* ctr,
+                          uint32_t* d_seq, void* stream) {
+    if (n_embd % kQK != 0 || n_tok * k > 256 || n_tok < 1) {
+        std::fprintf(stderr, "doorbell_publish_q8k: n_embd must be a multiple of 256 and n_tok * k <= 256\n");
+        std::exit(1);
+    }
+    doorbell_q8k_kernel<<<(unsigned) (n_tok * (n_embd / kQK)), 256, 0, (cudaStream_t) stream>>>(
+        x, ids, weights, n_embd, (int) (n_tok * k), x_out, ids_out, weights_out, xk_out, ctr, d_seq);
+    check_launch("doorbell_publish_q8k");
+}
+
+void quantize_q8k_rows(const float* x, int n_tok, int n_embd, uint8_t* out, void* stream) {
+    q8k_rows_kernel<<<(unsigned) (n_tok * (n_embd / kQK)), 256, 0, (cudaStream_t) stream>>>(x, n_embd, out);
+    check_launch("quantize_q8k_rows");
+}
+
 __global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }

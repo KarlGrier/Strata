@@ -26,6 +26,7 @@
 #include "strata/core/exchange_storage.hpp"
 #include "strata/core/hit_hook.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
 #include <array>
@@ -398,6 +399,11 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    /// Round 11 A.2 (STRATA_ROUTER_Q8K=1; the idea of fork Eddoursul d9ce223): this token group's activations as the
+    /// window's doorbell wrote them (mapped memory): ggml's Q8_K rows, `xk_stride` bytes apart, which the pool takes
+    /// for a layer whose gate/up activation is Q8_K (`pool_takes_q8k`) instead of quantizing the floats; null = off.
+    const uint8_t* xk = nullptr;
+    int64_t xk_stride = 0;
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with
@@ -489,6 +495,10 @@ struct PcieModel {
         return m;
     }
 };
+
+/// Round 11 A.2: whether the pool takes a native layer's gate/up activation as the doorbell's Q8_K rows (the
+/// i-quants' and K-quants' vec_dot_type; not the Q2_0 kernels' own activation).
+inline bool pool_takes_q8k(const strata::kernels::cpu::NativeFmt& f) { return f.gu_type != 42 && f.gu_act == 15; }
 
 /// The adapter's own state.  One per session, reused every layer so the token path allocates nothing (P2.T10).
 struct ForesightSwap;

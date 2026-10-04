@@ -74,6 +74,13 @@ constexpr int kFusedGrWideT = kWindowMaxT;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+/// round 11 B.1 (STRATA_GR_FORK=1): the fork's read keeps counters, sums of squares and partial dots in the xn scratch
+/// (26,304 floats, rounded up); a window's two token groups each take one (the callers pass grp * this as the offset),
+/// so the callers allocate at least kGrForkScratchMin floats there.
+constexpr int64_t kGrForkScratchFloats = 26368;
+constexpr int64_t kGrForkScratchMin = 2 * kGrForkScratchFloats;
+/// round 11 B.1: true when STRATA_GR_FORK=1 (the callers then pass each token group its own fork scratch)
+bool fused_gr_fork_enabled();
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);

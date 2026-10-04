@@ -431,7 +431,7 @@ __device__ __forceinline__ void q8k_block(float v, uint32_t* blk) {
         d = __fdiv_rn(1.0f, iscale);
     }
     b[4 + t] = (uint8_t) (int8_t) q;
-    int s16 = q;   // groups of 16 lanes: exact int sums
+    int s16 = (int) (int8_t) q;   // groups of 16 lanes: exact int sums of the stored int8 values, as ggml sums them
     for (int o = 8; o > 0; o >>= 1) s16 += __shfl_xor_sync(0xffffffffu, s16, o);
     if ((t & 15) == 0) {
         const int16_t bs = (int16_t) s16;

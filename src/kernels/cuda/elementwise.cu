@@ -424,7 +424,9 @@ __device__ __forceinline__ void q8k_block(float v, uint32_t* blk) {
     float d = 0.0f;
     if (!s_zero) {
         const float iscale = __fdiv_rn(-127.0f, s_max);
-        q = __float2int_rn(__fmul_rn(iscale, v));
+        // ggml's nearest_int exactly: the product, + 1.5 * 2^23, the low 23 bits of the sum minus 2^22 (round half
+        // to even for |x| < 2^22, and the same bits as ggml for inf / NaN when -127/max overflows)
+        q = (__float_as_int(__fadd_rn(__fmul_rn(iscale, v), 12582912.0f)) & 0x007fffff) - 0x00400000;
         q = min(127, q);
         d = __fdiv_rn(1.0f, iscale);
     }

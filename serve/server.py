@@ -3115,7 +3115,8 @@ class Service:
         # A prompt re-encodes only what follows the last special token it shares with a recent prompt (the same ids
         # as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points encode in full.
         self.prompts = None
-        if hasattr(tokenizer, "encode_marked"):
+        # round 11 A/B switch for upstream PR #567: STRATA_PROMPT_ENCODER_OLD=1 = the full encode every request
+        if hasattr(tokenizer, "encode_marked") and not os.environ.get("STRATA_PROMPT_ENCODER_OLD"):
             from strata_tokenizer import PromptEncoder
             self.prompts = PromptEncoder(tokenizer)
 

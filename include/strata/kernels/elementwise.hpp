@@ -142,6 +142,17 @@ bool doorbell_payload_ready(const uint32_t* h_seq, const float* h_x, int64_t n, 
 /// Spins on doorbell_payload_ready for up to `timeout_ms`; false on timeout.
 bool doorbell_wait_payload(const uint32_t* h_seq, const float* h_x, int64_t n, const int32_t* h_ids,
                            const float* h_weights, int64_t k, uint32_t want, int timeout_ms = 2000);
+/// Round 11 (the idea of fork Eddoursul d9ce223): the doorbell above, and also each token's activation as ggml's Q8_K
+/// rows (quantize_row_q8_K_ref, bit for bit: the block's first largest |x| sets the sign, iscale = -127/max with
+/// IEEE division, round half to even, int bsums, d = 1/iscale) in mapped memory, so the CPU pool does not quantize
+/// before its workers start.  One block per 256-value superblock (n_tok * n_embd / 256 blocks); the last block to finish
+/// rings.  `ctr` is a device counter, 0 between launches (the last block wraps it).  `xk_out` holds n_tok rows of
+/// n_embd / 256 blocks of 292 bytes (4-byte stores).
+void doorbell_publish_q8k(const float* x, const int32_t* ids, const float* weights, int n_tok, int n_embd, int64_t k,
+                          float* x_out, int32_t* ids_out, float* weights_out, uint8_t* xk_out, unsigned* ctr,
+                          uint32_t* d_seq, void* stream);
+/// The same Q8_K rows into device memory without a doorbell (the parity test).
+void quantize_q8k_rows(const float* x, int n_tok, int n_embd, uint8_t* out, void* stream);
 
 /// Plan v0.3 P3: copy `n` int32 from mapped pinned host memory into device memory with a kernel (the QSA
 /// per-token step and positions), instead of a host-to-device memcpy node in the middle of a layer.

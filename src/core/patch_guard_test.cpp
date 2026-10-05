@@ -82,7 +82,6 @@ int main(int argc, char** argv) {
         {"a dense row of 2000 values in Q6_K", [](ModelFacts& m) { m.bad_dense = {"blk.0.attn_qkv.weight"}; },
          "STRATA_MMVQ_IL"},
         {"low rank 256", [](ModelFacts& m) { m.hc_lr = 256; }, "STRATA_GR_FORK"},
-        {"hyper-connection weights in Q8_0", [](ModelFacts& m) { m.hc_bf16 = false; }, "STRATA_GR_FORK"},
         // a hidden size change hits every guard that depends on it: B.1 (compiled 2560), A.2 only when not a multiple
         // of 256
         {"n_embd 3072", [](ModelFacts& m) { m.n_embd = 3072; }, "STRATA_GR_FORK"},

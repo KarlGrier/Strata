@@ -8107,6 +8107,18 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
+    if (tpath / "vocab.json").exists():   # round 13: the server's fixed strings vs this model (serve/model_check.py)
+        from serve import model_check
+        mc = model_check.check(tok, tpl.read_text(encoding="utf-8") if tpl.exists() else "", vision=vision is not None)
+        for line in mc:
+            print(f"[strata] model check: {line}", flush=True)
+        for patch, how in model_check.apply(mc).items():
+            print(f"[strata] model check: {patch} off ({how})", flush=True)
+            if patch == "web search":
+                web_cfg = None
+        if not mc:
+            print("[strata] model check: the tokenizer and the chat template have every string the server writes or "
+                  "parses itself", flush=True)
     if web_cfg is not None:
         svc.web = web_cfg
         print(f"[strata] web search for the web app's chat: {websearch.status(web_cfg)}", flush=True)

@@ -76,6 +76,8 @@ constexpr int64_t kGrForkScratchFloats = 26368;
 constexpr int64_t kGrForkScratchMin = 2 * kGrForkScratchFloats;
 /// round 11 B.1: true when STRATA_GR_FORK=1 (the callers then pass each token group its own fork scratch)
 bool fused_gr_fork_enabled();
+/// round 13: n_embd, streams and low rank the fork read (and this file's reads) are compiled for (the patch guard)
+void fused_gr_fork_geometry(int& n, int& hc, int& lr);
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);

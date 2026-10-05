@@ -579,7 +579,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # about arithmetic, and this one knows the ORDER the arithmetic happens in.
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/remote_expert_opt.cu
-    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
+    src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/patch_guard.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -1030,6 +1030,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
+  add_executable(patch_guard_test src/core/patch_guard_test.cpp)   # round 13: the patch guards (no GPU)
+  target_include_directories(patch_guard_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(patch_guard_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
   add_executable(native_grouped_parity src/kernels/native_grouped_parity.cpp)
   target_include_directories(native_grouped_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(native_grouped_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})

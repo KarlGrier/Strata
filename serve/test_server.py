@@ -1791,16 +1791,21 @@ class IncrementalPrompts(unittest.TestCase):
 
     def test_turns(self):
         self.assertIsNotNone(self.svc.prompts)
-        msgs = [{"role": "system", "content": "Be brief."}]
-        for turn in range(6):
-            msgs.append({"role": "user", "content": f"question {turn} <|im_end|> é你 " * (turn + 1)})
-            status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
-            self.assertEqual(status, 200, b)
-            prompt = self.svc.template.render(msgs)
-            self.assertEqual(self.engine.last_ids, self.svc.tok.encode(prompt, parse_special=True))
-            if turn:
-                self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
-            msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
+        full = Service(self.engine, self.svc.tok, self.svc.template)
+        full.prompts = None                                  # the reference: the same prompt, encoded in full
+        # round 13: our #567 port encodes a prompt in full when a message holds a literal (#537 / #931 plain spans;
+        # upstream's newer #567 head encodes those incrementally too) - so reuse is asserted on the plain conversation
+        for literal in (" <|im_end|>", ""):
+            msgs = [{"role": "system", "content": "Be brief."}]
+            for turn in range(6):
+                msgs.append({"role": "user", "content": f"question {turn}{literal} é你 " * (turn + 1)})
+                status, b = self.post("/v1/chat/completions", {"model": "m", "max_tokens": 64, "messages": msgs})
+                self.assertEqual(status, 200, b)
+                prompt = self.svc.template.render(msgs)
+                self.assertEqual(self.engine.last_ids, full.encode_prompt(msgs, None, {}))   # #931: <|im_end|> is text
+                if turn and not literal:
+                    self.assertGreater(self.svc.prompts.last_reused, len(prompt) // 3)
+                msgs.append({"role": "assistant", "content": b["choices"][0]["message"]["content"]})
 
     def test_same_ids_as_a_full_encode_on_varied_conversations(self):
         import random
@@ -1818,7 +1823,11 @@ class IncrementalPrompts(unittest.TestCase):
 
     def test_a_tokenizer_without_resume_points_encodes_in_full(self):
         class Plain:
-            encode = ByteTokenizer().encode
+            """ByteTokenizer without the resume points (#567 head d55679c: it has #931's control_tokens)."""
+            def __getattr__(self, name):
+                if name in ("encode_marked", "max_special_len"):
+                    raise AttributeError(name)
+                return getattr(ByteTokenizer(), name)
         svc = Service(self.engine, Plain(), self.svc.template)
         self.assertIsNone(svc.prompts)
         self.assertEqual(svc._encode_rendered("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))

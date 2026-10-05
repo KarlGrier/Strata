@@ -99,6 +99,7 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
+#include "strata/spec/cost_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -16869,7 +16870,9 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                        if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                        else
+                            while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -18703,7 +18706,9 @@ int main(int argc, char** argv) {
                 T = std::clamp(chain_rows, 1, S_mtp);
             } else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                else
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
 #if defined(STRATA_HAVE_DFLASH2)
             if (use_df2 && o.draft_conf > 0.0) {   // DFlash2's own confidence: the chance that every draft so far holds, from the selector's probabilities

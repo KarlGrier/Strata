@@ -78,6 +78,7 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
+#include "strata/spec/cost_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -12863,7 +12864,9 @@ int main(int argc, char** argv) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                    else
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
                 if (first_window) T = 1;
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -14083,7 +14086,9 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                else
+                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
             if (first_window) T = 1;
             bool from_sfx = false;

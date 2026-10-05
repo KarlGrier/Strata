@@ -4,6 +4,7 @@
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
+#include "strata/spec/cost_gate.hpp"
 #include "strata/core/spec_exact.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
@@ -1723,7 +1724,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
-        for (int j = 1; j < max_steps && pj >= min_p; ++j) {
+        // STRATA_COST_GATE (round 12): the next step runs while the window would keep its draft (cost_gate.hpp)
+        const strata::spec::CostGate& cg = strata::spec::cost_gate();
+        double cg_p = 1.0;
+        auto more = [&](int j, float p) {
+            if (!cg.on) return p >= min_p;
+            cg_p *= cg.a(j - 1, p);
+            return cg_p >= cg.th(j - 1);
+        };
+        for (int j = 1; j < max_steps && more(j, pj); ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {

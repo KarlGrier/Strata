@@ -38,6 +38,8 @@ bool qsa_hip_wmma_active();
 /// attention through the int8 tensor-core kernel above with each query's cells split among up to 20 blocks, merged with
 /// the log-sum-exp rescale, its partials in `scratch` (`scratch_floats` available).  False (nothing
 /// launched) unless int8 KV on sm_80+: the caller keeps qsa_decode_attn_batch.  Not bitwise the decode kernel: (b).
+/// round 13: head size and query heads per KV head the kernels here are compiled for (the patch guard)
+void qsa_split_attn_geometry(int& hd, int& g);
 bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                            void* stream);

@@ -1814,14 +1814,14 @@ class IncrementalPrompts(unittest.TestCase):
             for seed in range(3):
                 for what, prompt in conversation_prompts(self.svc.template, random.Random(seed)):
                     with self.subTest(tokenizer=name, seed=seed, what=what):
-                        self.assertEqual(svc.encode_prompt(prompt), tok.encode(prompt, parse_special=True))
+                        self.assertEqual(svc._encode_rendered(prompt), tok.encode(prompt, parse_special=True))
 
     def test_a_tokenizer_without_resume_points_encodes_in_full(self):
         class Plain:
             encode = ByteTokenizer().encode
         svc = Service(self.engine, Plain(), self.svc.template)
         self.assertIsNone(svc.prompts)
-        self.assertEqual(svc.encode_prompt("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))
+        self.assertEqual(svc._encode_rendered("<|im_start|>hi"), ByteTokenizer().encode("<|im_start|>hi", True))
 
 
 class DyingEngine(MockEngine):

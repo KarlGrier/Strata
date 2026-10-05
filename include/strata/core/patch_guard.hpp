@@ -23,7 +23,7 @@ struct ModelFacts {
     long long head_count = 0, head_count_kv = 0, key_length = 0, hc = 0, hc_lr = 0, full_attention_interval = 0;
     long long ssm_inner = 0, ssm_state = 0, ssm_groups = 0, indexer_heads = 0, indexer_key = 0;
     long long ple_dim = 0, ple_ngram = 0, ple_heads = 0, n_vocab = 0, draft_vocab = -1, draft_max_id = -1;
-    bool ple_table = false, hc_bf16 = true, gdn = false, qsa = false;
+    bool ple_table = false, gdn = false, qsa = false;
     std::vector<std::string> bad_dense;    // 2-D dense weights in a B.3 format whose row length is not a multiple of 256
     std::vector<std::string> expert_types; // the routed experts' gate/up and down formats, "gate/down" per distinct pair
 };

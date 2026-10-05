@@ -19,6 +19,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/dma_batch.hpp"
+#include "strata/core/patch_guard.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
@@ -2962,6 +2963,14 @@ int main(int argc, char** argv) {
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "strata generate: reading the model's geometry from %s: %s\n",
                              o.native_preset.c_str(), e.what());
+                return 1;
+            }
+            // round 13: the local patches' assumptions about the model, checked before any kernel reads its switch
+            // (include/strata/core/patch_guard.hpp, patches/LEDGER.md): a mismatch turns that patch off, one line
+            try {
+                strata::core::run_patch_guards(strata::core::read_model_facts(o.native_shards, o.mtp));
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: the patch guards could not read the model's header: %s\n", e.what());
                 return 1;
             }
         }

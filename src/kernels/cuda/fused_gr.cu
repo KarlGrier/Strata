@@ -2397,6 +2397,8 @@ void fused_gr_dequant_q8_0(const uint8_t* q8, uint16_t* bf16, int64_t n_blocks, 
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream) {
     gr_quantize_q8_0_kernel<<<(unsigned) ((n_blocks + 7) / 8), 256, 0, (cudaStream_t) stream>>>(bf16, out, n_blocks);
 }
+// round 13 (patch_guard.cpp): the geometry the fork read is compiled for (this file's N, HC, LR)
+void fused_gr_fork_geometry(int& n, int& hc, int& lr) { n = N; hc = HC; lr = LR; }
 
 bool fused_gr_fork_enabled() {
     static const bool on = [] { const char* v = std::getenv("STRATA_GR_FORK"); return v != nullptr && std::atoi(v) != 0; }();

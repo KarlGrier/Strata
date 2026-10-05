@@ -1702,6 +1702,9 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
 // prompt path's int8 tensor-core kernel with each query's cells split among up to 20 blocks (one wave), merged with the
 // log-sum-exp rescale.  int8 KV on sm_80+ only (false otherwise: the caller keeps qsa_decode_attn_batch).  The
 // partials live in the decode scratch (n_q x splits x n_head x (HD + 2) floats, within qsa_decode_attn_scratch_floats).
+// round 13 (patch_guard.cpp): the head size and query heads per KV head this file's kernels are compiled for
+void qsa_split_attn_geometry(int& hd, int& g) { hd = HD; g = G; }
+
 bool qsa_decode_attn_split(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, uint64_t scratch_floats, float* attn, int64_t n_q,
                            void* stream) {

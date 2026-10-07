@@ -161,14 +161,6 @@ int run_patch_guards(const ModelFacts& f) {
              return "";
          },
          [] { setenv_off("STRATA_QSA_SPLIT_ATTN", "0"); }},
-        {"mmvq_il", "B.3: interleaved q8_1 activations, whole rows a warp (table measured on the RTX 5080)", "STRATA_MMVQ_IL=0",
-         [](const ModelFacts& m) -> std::string {
-             if (!m.bad_dense.empty())
-                 return m.bad_dense.front() + " (and " + str((long long) m.bad_dense.size() - 1) +
-                        " more): a row length that is not a whole number of blocks";
-             return "";
-         },
-         [] { setenv_off("STRATA_MMVQ_IL", "0"); }},
         {"gr_fork", "B.1: fork Eddoursul's hyper-connection read", "STRATA_GR_FORK=0",
          [gr_n, gr_hc, gr_lr](const ModelFacts& m) -> std::string {
              if (m.n_embd != gr_n || m.hc != gr_hc || m.hc_lr != gr_lr)

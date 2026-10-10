@@ -1201,10 +1201,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
-                if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv; on the
-                    // branch it is native_mmvq's own kernel (F4's interleaved copy is bitwise the same, and lives on cs)
+                if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
+                    // round 18: as C*14's B.3 did - the branch reads F4's interleaved copy too (written on cs before the
+                    // fork; bitwise native_mmvq's output), and qkv is recorded before the branch's launch, so its grid
+                    // is dispatched first and the conv / recurrence that wait for it start sooner (z is read only after
+                    // the recurrence).  The re-port had run the branch on native_mmvq's plain kernel in v0.1.40.2's
+                    // order: ~0.3 ms a verify window on this PC (round 18, part 1)
+                    const bool g_il = g_mmvq_il() && strata::kernels::native_mmvq_il_supported(wg->native_type, n, (int) ZV);
+                    if (g_il && !il_ready) {
+                        strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, n, cs);
+                        il_ready = true;
+                    }
                     if (!branch(pfork_, cs, side2_, "fork")) return false;
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
+                    mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
+                                                              (int) N, (int) ZV, n, side2_);
+                    else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
                     if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
                 }
                 if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
@@ -1217,7 +1229,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1402,9 +1414,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                    sel_ + (size_t) tb * cap_, ns);
                 };
                 // the attention's queries: the projection (mm on cs, which may read F4's interleaved copy; on a branch
-                // native_mmvq's own kernel - bitwise the same), the q/gate split with norm and RoPE, the rotation
+                // F4's kernel too since round 18, its copy written on cs before the fork - bitwise the same), the q/gate
+                // split with norm and RoPE, the rotation
+                const bool q_il = side_proj && g_mmvq_il() &&
+                                  strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
                     if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                    else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
+                                                                   qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
                     if (qb) {
@@ -1446,6 +1463,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
                 }
                 if (side_proj) {   // the queries beside the keys and values (fork b063c13)
+                    if (q_il && !il_ready) {   // round 18: the copy before the fork (mm(wk) / mm(wv) on cs reuse it)
+                        strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, n, cs);
+                        il_ready = true;
+                    }
                     if (!branch(pfork_, cs, side2_, "fork") || !q_chain(side2_)) return false;
                     if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the queries' branch could not join"; return false; }
                 }

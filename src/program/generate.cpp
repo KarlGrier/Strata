@@ -10868,7 +10868,8 @@ int main(int argc, char** argv) {
                     live_ok = true;
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
-                        const size_t n_parked = conversations.clear();
+                        const size_t n_parked = conversations.clear() + chat_parked.size();   // --chat-cache's too
+                        chat_parked.clear();
                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
@@ -11148,6 +11149,9 @@ int main(int argc, char** argv) {
                 checks.clear();
                 tail_ckpt_len = -1;
                 const size_t n_parked = conversations.clear();
+                // --chat-cache: our parked conversations go too, as upstream's (they may carry the poison)
+                const size_t n_chat = chat_parked.size();
+                chat_parked.clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
@@ -11160,10 +11164,11 @@ int main(int argc, char** argv) {
                         ++n_slots;
                     }
                 std::fprintf(stderr, "strata serve: after non-finite logits (#879): dropped the live session, %zu "
-                                     "checkpoint%s, %zu parked conversation%s and %zu idle slot%s (%zu running slot%s "
-                                     "not kept after their reply); reading this prompt from token 0\n", n_checks,
-                             n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
-                             n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
+                                     "checkpoint%s, %zu parked conversation%s, %zu chat-cache conversation%s and %zu idle "
+                                     "slot%s (%zu running slot%s not kept after their reply); reading this prompt from "
+                                     "token 0\n", n_checks, n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s",
+                             n_chat, n_chat == 1 ? "" : "s", n_slots, n_slots == 1 ? "" : "s", n_running,
+                             n_running == 1 ? "" : "s");
             }
             int64_t resume = 0;
             bool from_live = false;

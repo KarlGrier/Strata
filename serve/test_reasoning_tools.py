@@ -152,6 +152,57 @@ class QuotedThinkEnd(unittest.TestCase):
             self.assertEqual(joined(evs, "content"), "")
 
 
+class FencedThinkEnd(unittest.TestCase):
+    """A `</think>` inside a code fence of the reasoning is quoted text (a chat template or a test that holds one); a
+    fence the model never closes still cannot swallow the end of the thinking: the last `</think>` held is the end."""
+    # what the model wrote in the usability round's bug-fix runs: Python source, so `\n` is two characters
+    TEST = ('I will add this test:\n```python\n    def test_none(self):\n'
+            '        self.assertIn("<think>\\n\\n</think>\\n\\n", prompt)\n```\nNow read the file.\n')
+
+    def test_a_tag_in_a_fence_stays_reasoning_and_the_call_after_it_runs(self):
+        text = self.TEST + "</think>\n\n" + CALL
+        for width in (1, 2, 7, 100_000):
+            with self.subTest(width=width):
+                evs = run(text, width)
+                self.assertEqual([e.call.name for e in evs if e.kind == "tool_call"], ["read_file"])
+                self.assertEqual(joined(evs, "reasoning"), self.TEST)
+                self.assertEqual(joined(evs, "content"), "")
+
+    def test_the_hold_ends_when_the_fence_closes(self):
+        p = OutputParser(thinking=True, tools=TOOLS)
+        evs = p.feed(self.TEST[:self.TEST.index("```\nNow")])         # up to the closing fence: the tag is held
+        self.assertNotIn("</think>", joined(evs, "reasoning"))
+        evs += p.feed("```\nNow")                                     # the fence closed: it was reasoning text
+        self.assertIn("</think>", joined(evs, "reasoning"))
+        self.assertFalse([e for e in evs if e.kind == "content"])
+
+    def test_an_unclosed_fence_does_not_swallow_the_end(self):
+        thought = "the template:\n```jinja\n{{ '<think>' }} ..."
+        text = thought + "\n</think>\n\nThe answer is 4."
+        for width in (1, 7, 100_000):
+            with self.subTest(width=width):
+                evs = run(text, width)
+                self.assertEqual(joined(evs, "reasoning"), thought + "\n")
+                self.assertEqual(joined(evs, "content"), "The answer is 4.")
+
+    def test_an_unclosed_fence_falls_back_to_the_last_tag(self):
+        thought = 'see:\n```python\nassert out == "<think>\\n\\n</think>\\n\\nhi"\nmore'
+        text = thought + "\n</think>\n\n" + CALL
+        for width in (1, 7, 100_000):
+            with self.subTest(width=width):
+                evs = run(text, width)
+                self.assertEqual([e.call.name for e in evs if e.kind == "tool_call"], ["read_file"])
+                self.assertEqual(joined(evs, "reasoning"), thought + "\n")
+                self.assertEqual(joined(evs, "content"), "")
+
+    def test_a_turn_cut_inside_an_unclosed_fence(self):
+        thought = 'x:\n```\nprint("<think>\\n\\n</think>\\n\\nhi")'      # cut before the fence closes, one tag
+        for width in (1, 100_000):
+            with self.subTest(width=width):
+                evs = run(thought, width)
+                self.assertEqual(joined(evs, "reasoning") + "</think>" + joined(evs, "content"), thought)
+
+
 class OverHttp(unittest.TestCase):
     def test_finish_reasons_and_block_order(self):
         helper = UnfinishedToolCall("test_parser")

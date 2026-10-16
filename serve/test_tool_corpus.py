@@ -113,8 +113,10 @@ add("4077-stray-think-line", "The user wants a file with a literal.\n" + STRAY_V
 add("4077-stray-think-in-a-fence", "Content:\n```\n" + STRAY_VALUE + "\n```\nNow call it.\n</think>\n\n" +
     qwen("write_file", path="out.txt", content=STRAY_VALUE),
     [("write_file", {"path": "out.txt", "content": STRAY_VALUE})], thinking=True,
-    reasoning="Content:\n```\nreasoning sample:\n", content="answer sample\n```\nNow call it.",
-    source="#4077: the quote sat in a code fence, so the fence closes in the 'answer'")
+    # local (P021m's think-fence commit, our #2794): a </think> inside a code fence of the reasoning is quoted text, held
+    # until the fence closes - the reasoning stays whole and nothing leaks into the answer; the call arrives either way
+    reasoning="Content:\n```\n" + STRAY_VALUE + "\n```\nNow call it.", content="",
+    source="#4077: the quote sat in a code fence (local rule: held until the fence closes)")
 add("4077-stray-think-after-a-backtick", "The text is `" + STRAY_VALUE + "`. Call it.\n</think>\n\n" +
     qwen("write_file", path="out.txt", content=STRAY_VALUE),
     [("write_file", {"path": "out.txt", "content": STRAY_VALUE})], thinking=True,

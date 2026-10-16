@@ -1143,6 +1143,12 @@ class OutputParser:
         self.stray_think = 0         # ... and the strays of that kind dropped from the answer
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
+        # A `</think>` inside a code fence of the reasoning is quoted text (the model writing a chat template or a test
+        # that holds one), like the `<tool_call>` of #804/#1058.  From that tag on, the text is held here until the
+        # fence closes (then it was reasoning) or the turn ends with the fence still open (then the last `</think>`
+        # held is the end of the thinking, so a fence the model never closed cannot swallow the answer).
+        self.fhold: str | None = None
+        self.fhold_state = ("", "", 0)   # (fence, line, ticks) after the held text
         # recover (on in the server since 0.2.8, off for a bare OutputParser; the config's "tool_call_recovery": false turns it off): a declared tool's call written next to the template's
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
@@ -1317,6 +1323,24 @@ class OutputParser:
                 return k
             k = self.buf.find(THINK_END, k + 1)
         return -1
+
+    def _fenced_at(self, i: int) -> bool:
+        """The reasoning text before self.buf[i] leaves it inside a code fence (``` or ~~~)."""
+        snap = (self.fence, self.line, self.ticks)
+        self._track(self.buf[:i])
+        fenced = bool(self.fence)
+        self.fence, self.line, self.ticks = snap
+        return fenced
+
+    def _hold_more(self, text: str) -> bool:
+        """Add text to the fence hold (see __init__); True once the held text has closed its fence."""
+        self.fhold += text
+        snap = (self.fence, self.line, self.ticks)
+        self.fence, self.line, self.ticks = self.fhold_state
+        self._track(text)
+        self.fhold_state = (self.fence, self.line, self.ticks)
+        self.fence, self.line, self.ticks = snap
+        return not self.fhold_state[0]
 
     def _release(self, deliver: bool) -> list[Event]:
         """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""
@@ -1526,6 +1550,15 @@ class OutputParser:
                 else:
                     return out
             elif self.state == "reasoning":
+                if self.fhold is not None:
+                    more, self.buf = self.buf, ""
+                    if not self._hold_more(more):
+                        return out
+                    # the fence closed: the held `</think>` was quoted - reasoning text; the rest is read again
+                    held, self.fhold = self.fhold, None
+                    out.append(Event("reasoning", self._track(THINK_END)))
+                    self.buf = held[len(THINK_END):]
+                    continue
                 if self.pending:
                     # calls wait for what follows: more calls or whitespace keep them, `</think>` makes them acts,
                     # any other text means they were quoted
@@ -1572,6 +1605,17 @@ class OutputParser:
                     out.append(Event("reasoning", self._track(self.buf[:i + len(THINK_END)])))
                     self.buf = self.buf[i + len(THINK_END):]
                     continue
+                if self._fenced_at(i):               # inside a code fence: held until the fence closes (see __init__)
+                    if i:
+                        out.append(Event("reasoning", self._track(self.buf[:i])))
+                    self.fhold, self.fhold_state = "", (self.fence, self.line, self.ticks)
+                    held, self.buf = self.buf[i:], ""
+                    if self._hold_more(held):
+                        self.buf, self.fhold = self.fhold, None
+                        out.append(Event("reasoning", self._track(THINK_END)))
+                        self.buf = self.buf[len(THINK_END):]
+                        continue
+                    return out
                 if i:
                     out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
@@ -1777,6 +1821,16 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.fhold is not None:
+            # the fence never closed: the last `</think>` held is the end of the thinking (see __init__)
+            held, self.fhold = self.fhold + self.buf, None
+            last = held.rfind(THINK_END)
+            if last:
+                out.append(Event("reasoning", self._track(held[:last])))
+            self.buf = held[last + len(THINK_END):]
+            self.state, self.lead = "content", True
+            self.fence, self.line, self.ticks = "", "", 0
+            out += self.feed("")
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
             # is as whole as one in the answer: it waits for the turn's end like the others

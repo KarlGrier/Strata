@@ -1682,6 +1682,15 @@ class SamplingKeys(unittest.TestCase):
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
             self.assertNotIn("ckpt=0", self.keys(**absent), absent)
 
+    def test_chat_cache_owner_keys(self):
+        k = self.keys(temperature=0, strata_owner="research", strata_chat_drop="research")
+        self.assertIn("owner=research", k)
+        self.assertIn("chat_drop=research", k)
+        for bad in ("", "two words", "a" * 33, "x=1", 7, None, ["research"]):
+            k = self.keys(temperature=0, strata_owner=bad, strata_chat_drop=bad)
+            self.assertFalse([x for x in k if x.startswith(("owner=", "chat_drop="))], bad)
+        self.assertFalse([x for x in self.keys(temperature=0) if x.startswith(("owner=", "chat_drop="))])
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))

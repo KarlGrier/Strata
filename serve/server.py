@@ -1464,6 +1464,13 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+        # (local, 2026-10-19) "strata_owner": "research" tags what this request leaves in the conversation cache;
+        # "strata_chat_drop": "research" drops every parked conversation with that tag before the request (a research
+        # run's report stage; deep-research's proxy sends both).  A short word only; anything else is not sent.
+        for field, key in (("strata_owner", "owner"), ("strata_chat_drop", "chat_drop")):
+            v = sampling.get(field)
+            if isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", v):
+                keys += f" {key}={v}"
         # #2228: the pictures' keys (hex, in prompt order): the engine matches a picture by them, not by its embeddings
         ik = sampling.get("strata_img_keys")
         if isinstance(ik, list) and ik and all(isinstance(k, str) and k and all(c in "0123456789abcdef" for c in k)

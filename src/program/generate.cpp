@@ -11821,8 +11821,12 @@ int main(int argc, char** argv) {
             uint64_t used = 0;                                      // LRU clock
             uint64_t id = 0;
             size_t bytes = 0;
+            std::string owner;                                      // the GEN key owner= that left it ("" = none)
         };
         std::vector<Parked> chat_parked;
+        // owner= of the requests that made the live conversation (deep-research's proxy tags its calls "research"; the
+        // user's chats carry no tag): a parked copy keeps it, and a later chat_drop=TAG drops every copy of TAG's
+        std::string live_owner;
         uint64_t park_clock = 0;
         // host -> host copies of up to ~1.5 GB: split over threads (one core copies ~10 GB/s)
         auto par_copy = [](uint8_t* dst, const uint8_t* src, size_t bytes) {
@@ -11850,6 +11854,7 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             cudaDeviceSynchronize();
             Parked pk;
+            pk.owner = live_owner;
             pk.cells = longest_check(checks);
             pk.blocks = std::min<int64_t>((pk.cells + stash_qs.page_size - 1) / stash_qs.page_size,
                                           ss.qsa_states[0].max_cells / stash_qs.page_size);
@@ -12299,6 +12304,7 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            std::string req_owner, req_chat_drop;   // the conversation cache's owner tag / drop (see live_owner)
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -12329,6 +12335,8 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "owner") req_owner = tok.substr(eq + 1);
+                    else if (key == "chat_drop") req_chat_drop = tok.substr(eq + 1);
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -12923,6 +12931,26 @@ int main(int argc, char** argv) {
             const bool chat_cache_on = o.chat_cache > 0 && o.prompt_cache > 0 && stash_supported() &&
                                        !ckpt_pool.on();   // (the pool reuses a parked checkpoint's storage)
             if (chat_cache_on) {
+                // chat_drop=TAG (deep-research: the first calls of a research run's report stage): every parked
+                // conversation TAG's requests left is dropped now - nothing of that run is continued after its lead
+                // has answered - and so is the live one, if it is TAG's and this request takes the session from it
+                bool drop_live = false;
+                if (!req_chat_drop.empty()) {
+                    size_t n_drop = 0, b_drop = 0;
+                    for (size_t i = 0; i < chat_parked.size();) {
+                        if (chat_parked[i].owner == req_chat_drop) {
+                            ++n_drop;
+                            b_drop += chat_parked[i].bytes;
+                            chat_parked.erase(chat_parked.begin() + (std::ptrdiff_t) i);
+                        } else {
+                            ++i;
+                        }
+                    }
+                    drop_live = live_owner == req_chat_drop;
+                    if (n_drop > 0)
+                        std::fprintf(stderr, "strata serve: chat cache: dropped %zu parked conversation%s of '%s' (%.0f MiB)\n",
+                                     n_drop, n_drop == 1 ? "" : "s", req_chat_drop.c_str(), (double) b_drop / 1048576.0);
+                }
                 int64_t best = 0;
                 size_t best_i = 0;
                 for (size_t i = 0; i < chat_parked.size(); ++i) {
@@ -12935,7 +12963,8 @@ int main(int argc, char** argv) {
                     // this request continues a parked conversation: swap it in (reading 256 tokens beats a swap)
                     Parked target = std::move(chat_parked[best_i]);   // out of the store first: parking may evict
                     chat_parked.erase(chat_parked.begin() + (std::ptrdiff_t) best_i);
-                    park();
+                    if (drop_live) checks.clear();   // chat_drop: the live conversation is not kept
+                    else park();
                     unpark(std::move(target));
                     resume = best;
                     from_live = false;
@@ -12950,7 +12979,8 @@ int main(int argc, char** argv) {
                     if (resume > 0 && !from_live)
                         for (const ConvCheckpoint& c : checks)
                             if ((int64_t) c.ids.size() == resume) { keep.push_back(c); break; }
-                    park();
+                    if (drop_live) checks.clear();   // chat_drop: the live conversation is not kept (the root copy is)
+                    else park();
                     if (keep.empty()) resume = 0;
                     else checks = std::move(keep);
                     from_live = false;
@@ -15303,6 +15333,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
                              (long long) pp_reached);
             }
+            live_owner = req_owner;   // the session's checkpoints are this request's now (the chat cache's owner tag)
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and

@@ -2303,6 +2303,11 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(prefill_fused_iq_test_f16 PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_F16=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
       add_test(NAME prefill_fused_iq_test_ws COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test_ws PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_WS=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # r22: STRATA_PREFILL_V2's kernels (IQ3_XXS gate/up, IQ4_NL down; adapted from Basalt, MIT) against the reference
+      # and the current fused kernels, at chosen rows per expert - the same program, its pairs v2 takes (exit 77 without
+      # a CUDA device, or where v2 does not run); `prefill_fused_iq_test --v2` without --no-timing also times them
+      add_test(NAME prefill_fused_v2_test COMMAND prefill_fused_iq_test --v2 --no-timing)
+      set_tests_properties(prefill_fused_v2_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)

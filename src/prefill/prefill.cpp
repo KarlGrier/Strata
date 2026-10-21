@@ -126,6 +126,12 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
 bool native_wide() { return false; }
 void experts_native(const WideBatch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
+int native_v2_mode() { return 0; }
+bool native_v2_requested() { return false; }
+bool native_v2_built() { return false; }
+bool native_v2_ready() { return false; }
+bool native_v2_takes(int, bool) { return false; }
+void native_v2_override(int) {}
 }  // namespace strata::prefill::fused
 #endif
 #ifndef STRATA_PREFILL_WS
@@ -1413,6 +1419,35 @@ const MmqPlan& mmq_plan() {
             }
             std::fprintf(stderr, "strata: prompt MMQ sorts the full expert groups (STRATA_MMQ_GROUP_SORT=1): %lld of %lld "
                                  "layers\n", (long long) ns, (long long) layers);
+        }
+        // STRATA_PREFILL_V2 (moe_fused_iq.hpp; adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc): one
+        // line at start - the layers whose fused native expert work the v2 kernels take (on the streamed chunks that
+        // run the fused kernels; not with --peer-device).  Unset or 0: nothing here runs.
+        if (fused::native_v2_requested()) {
+            const char* v2_env = std::getenv("STRATA_PREFILL_V2");
+            if (!fused::native_v2_built()) {
+                std::fprintf(stderr, "strata: STRATA_PREFILL_V2=%s: the v2 prompt expert kernels are CUDA only; the current "
+                                     "kernels stay\n", v2_env ? v2_env : "");
+            } else if (lay.native && fused::native_v2_ready()) {   // (not ready: v2's setup said why, once per device)
+                int64_t n_gu = 0, n_d = 0;
+                for (int64_t l = 0; on && l < layers; ++l) {
+                    if (!p.layer[(size_t) l] && !p.fo[(size_t) l]) continue;
+                    const auto& f = lay.fmt[(size_t) l];
+                    if (f.had_gu || f.had_d || !fused::native_supported(f.gu_type, f.d_type)) continue;
+                    n_gu += fused::native_v2_takes(f.gu_type, true);
+                    n_d += fused::native_v2_takes(f.d_type, false);
+                }
+                if (n_gu + n_d > 0)
+                    std::fprintf(stderr, "strata: prompt experts: v2 kernels for IQ3_XXS gate/up (%lld of %lld layers), IQ4_NL "
+                                         "down (%lld of %lld layers) (STRATA_PREFILL_V2=%s, adapted from Basalt)\n",
+                                 (long long) n_gu, (long long) layers, (long long) n_d, (long long) layers, v2_env ? v2_env : "");
+                else
+                    std::fprintf(stderr, "strata: STRATA_PREFILL_V2=%s: no layer takes the fused native prompt kernels with "
+                                         "IQ3_XXS gate/up or IQ4_NL down; nothing changes\n", v2_env ? v2_env : "");
+            } else if (!lay.native) {
+                std::fprintf(stderr, "strata: STRATA_PREFILL_V2=%s: not a native pack (the v2 kernels read IQ3_XXS / IQ4_NL "
+                                     "experts); nothing changes\n", v2_env ? v2_env : "");
+            }
         }
         return p;
     }();

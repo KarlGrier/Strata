@@ -2,10 +2,17 @@
 #include "strata/core/patch_guard.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/prefill/moe_fused_iq.hpp"   // the v2 kernels' compiled shapes (constants only: no link to the prefill)
+
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+#define STRATA_GUARD_CUDA 1
+#include <cuda_runtime.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +48,14 @@ struct Guard {
 };
 
 void setenv_off(const char* key, const char* value) { setenv(key, value, 1); }
+
+// STRATA_PREFILL_V2 asked for (1..3, as moe_fused_iq.cu reads it): only then are its assumptions checked and the
+// GPUs probed
+bool prefill_v2_asked() {
+    const char* v = std::getenv("STRATA_PREFILL_V2");
+    const int m = v != nullptr ? std::atoi(v) : 0;
+    return m >= 1 && m <= 3;
+}
 
 bool forced(const char* name) {
     const char* v = std::getenv("STRATA_GUARD_FORCE");
@@ -106,6 +121,23 @@ ModelFacts read_model_facts(const std::vector<std::string>& native_shards, const
         }
     }
     f.expert_types.assign(pairs.begin(), pairs.end());
+    // STRATA_PREFILL_V2's GPUs: the CUDA devices of compute capability 8.0+ with the v2 kernels' shared memory per block
+    // (STRATA_EMULATE_CC counts, as in moe_fused_iq.cu).  Not asked for: no device query.
+    if (prefill_v2_asked()) {
+        f.gpus_v2 = 0;
+#if defined(STRATA_GUARD_CUDA)
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) n = 0;
+        for (int d = 0; d < n; ++d) {
+            int major = 0, smem = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
+                cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, d) == cudaSuccess &&
+                strata::cc_major_of(major) >= 8 && strata::smem_optin_of(smem) >= strata::prefill::fused::kV2SharedBytes)
+                ++f.gpus_v2;
+        }
+        cudaGetLastError();
+#endif
+    }
     if (!mtp_dir.empty()) {
         std::ifstream in(mtp_dir + "/draft_vocab.bin", std::ios::binary);
         if (in) {
@@ -183,6 +215,33 @@ int run_patch_guards(const ModelFacts& f) {
              return "";
          },
          [] { setenv_off("STRATA_DRAFT_CUM", "0"); }},
+        // r22: the v2 fused prompt expert kernels (adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc) -
+        // compiled for K = 2560 (gate/up) and 640 (down) and the IQ3_XXS / IQ4_NL block layouts; CUDA sm_80+ with
+        // kV2SharedBytes of shared memory per block.  Checked only when STRATA_PREFILL_V2 asks for them.
+        {"prefill_v2", "v2 fused prompt expert kernels for IQ3_XXS gate/up and IQ4_NL down", "STRATA_PREFILL_V2=0",
+         [](const ModelFacts& m) -> std::string {
+             if (!prefill_v2_asked()) return "";   // off (the default): the patch is inactive
+             namespace F = strata::prefill::fused;
+             if (m.n_embd != F::kV2Embd || m.n_ff != F::kV2FF)
+                 return "n_embd " + str(m.n_embd) + ", expert n_ff " + str(m.n_ff) + "; compiled for " + str(F::kV2Embd) +
+                        " / " + str(F::kV2FF);
+             bool any = false;
+             std::string types;
+             for (const std::string& t : m.expert_types) {
+                 const size_t at = t.find('/');
+                 const std::string gu = t.substr(0, at), d = at == std::string::npos ? "" : t.substr(at + 1);
+                 any |= gu == "IQ3_XXS" || d == "IQ4_NL";
+                 types += (types.empty() ? "" : " ") + t;
+             }
+             if (!any)
+                 return "no routed-expert layer has IQ3_XXS gate/up or IQ4_NL down (experts " +
+                        (types.empty() ? std::string("-") : types) + ")";
+             if (m.gpus_v2 == 0)
+                 return "no visible CUDA device of compute capability 8.0+ with " + str(F::kV2SharedBytes) +
+                        " bytes of shared memory per block (the v2 kernels are CUDA only)";
+             return "";
+         },
+         [] { setenv_off("STRATA_PREFILL_V2", "0"); }},
     };
     const bool list = std::getenv("STRATA_GUARD_LIST") != nullptr && std::atoi(std::getenv("STRATA_GUARD_LIST")) != 0;
     int off = 0;

@@ -18,6 +18,7 @@
 // for the k of a half-block: mma k index 16h + 4t + j stands for weight (and activation) 16h + t + 4j.  The
 // activations are stored in it (perm32), and a lane's two B registers (h = 0 and 1) are adjacent: one 8-byte load.
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/moe_fused_iq.hpp"   // native_v2_requested(), kV2CounterBytes (group_bytes)
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 
@@ -697,7 +698,11 @@ bool requested() {
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }
 size_t group_bytes(int64_t n, int n_expert) {
-    return tiles_at(n_expert) + ((size_t) (n + kTileRows - 1) / kTileRows + (size_t) n_expert) * sizeof(int2);
+    // + kV2CounterBytes when STRATA_PREFILL_V2 asks for the v2 kernels: their item counters, past the tiles
+    // (moe_fused_iq.cu's v2_counters; adapted from Basalt (MIT), src/prefill/moe_fused.cu at d9915bbc, where the 64
+    // bytes are always there - here only when asked for, so the default sizes stay as they were)
+    return tiles_at(n_expert) + ((size_t) (n + kTileRows - 1) / kTileRows + (size_t) n_expert) * sizeof(int2) +
+           (native_v2_requested() ? kV2CounterBytes : 0);
 }
 
 void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* stream) {

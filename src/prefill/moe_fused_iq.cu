@@ -40,6 +40,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -723,6 +724,383 @@ native_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_
 #endif
 }
 
+#if !defined(__HIPCC__)
+// ---- v2 (STRATA_PREFILL_V2, off by default; moe_fused_iq.hpp): IQ3_XXS gate/up and IQ4_NL down.
+//
+// Adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc (introduced there as STRATA_PF_FUSED_V2=1, the
+// default from 36afdf5e; the kernel is unchanged in Basalt through fb0944c7 but for comments and names).  Basalt's
+// notice:
+//
+//   Copyright (c) 2026 Jesús Gulfo
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+//   documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+//   the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+//   permit persons to whom the Software is furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+//   the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+//   THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+//   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+//
+// What v2 does differently from native_kernel above (Basalt's description): native_kernel decodes a stage's weights
+// into shared memory for 64 or 128 routed rows, reads each weight from global memory with 16-bit loads that touch one
+// line per row, and pays three float operations per output and 32 values.  v2 instead:
+//   - copies each weight row's raw GGUF bytes with 16-byte cp.async (from the 16-byte aligned chunks around them; the
+//     bytes keep their offset within 16) - coalesced, no decode stage in between;
+//   - decodes the weights straight into the mma A fragments (lane (g, t) needs entries t and 4 + t of rows g and g + 8
+//     of a 32-value sub-block: two codebook words with their signs, or one IQ4_NL word through the table);
+//   - gives every warp its own 32 weight rows against all the item's routed rows (up to 128, 16 n8 tiles), so each
+//     weight is decoded once per item and no warp waits for another's decode;
+//   - takes the dot's scale in one fma: d_w is a half times a small integer, so 1.5 * 2^23 * d_w is exact and
+//     fma(as_float(D), d_w, -1.5 * 2^23 * d_w) is round(dot * d_w); then acc = fma(that, d_x, acc);
+//   - hands out items through an atomic counter (items differ in size: their routed rows), and prefetches the next
+//     item's first weights into L2 while the current one runs.
+//
+// The arithmetic against native_kernel (every place it differs; checked against our native_kernel for these two
+// formats, which is Basalt's pre-v2 kernel for them line for line on sm_80+):
+//   - the int32 dot of a 32-value sub-block: the same (mma.sync m16n8k32 from C = MAGIC, exact);
+//   - d_w: the same value (IQ3_XXS: d / 4 * (2s + 1) here, d * (2s + 1) / 4 there - both exact; IQ4_NL: d);
+//   - the term of a sub-block: native_kernel acc = fma(round(d_w * d_x), dot, acc), v2 acc = fma(round(dot * d_w),
+//     d_x, acc): both two FP32 roundings, of different products - the one place the results differ (~1 ulp a term);
+//   - the order along K: the same in both, the 32-value sub-blocks one after another (native_kernel two a 64-value
+//     stage, v2 four a 128-value chunk), one FP32 accumulator per output;
+//   - SwiGLU, H's max per 32 features (two warps' maxima through shared memory here, shuffles there: max is exact in
+//     any order), its int8 rounding (__float2int_rn(h * 127 / max)) and scale (max / 127): the same formulas - so an H
+//     code moves by one only where the ~1 ulp difference of h crosses a rounding boundary;
+//   - the down outputs: the accumulators as they are, in both;
+//   - the activations, the grouping, H's layout and the rows each item covers: the same buffers and tables.
+// Not changed against Basalt: the kernel body (only cp4 is defined here; moe_fused.cu has its own).  Changed: the
+// switch (STRATA_PREFILL_V2, off by default, 2 / 3 for one half only), the counters' bytes (group_bytes adds them only
+// when v2 is asked for), the device check (STRATA_EMULATE_CC, a Turing opt-in device and the shared memory per block
+// count; one line naming why a device keeps the kernels above), and no HIP build.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+__device__ __forceinline__ void cp4(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
+                 "l"(src));
+}
+// 32 bits at an even offset of shared memory
+__device__ __forceinline__ uint32_t lds32_2a(const uint8_t* sm, uint32_t off) {
+    const uint32_t* q = (const uint32_t*) (sm + (off & ~3u));
+    return __byte_perm(q[0], q[1], (off & 2u) ? 0x5432u : 0x3210u);
+}
+__device__ __forceinline__ uint32_t lds16(const uint8_t* sm, uint32_t off) { return *(const uint16_t*) (sm + off); }
+// four codebook bytes with sign bits `nib` (bit k: byte k negative); the IQ3_XXS bytes are 4..62, so the
+// per-byte negation (b ^ 0xFF) + 1 never carries into the next byte
+__device__ __forceinline__ uint32_t signed4(uint32_t gw, uint32_t nib) {
+    const uint32_t s01 = (nib * 0x00204081u) & 0x01010101u;
+    return (gw ^ (s01 * 0xFFu)) + s01;
+}
+// IQ3_XXS sub-block `ib` of the super-block at shared offset `ro`, as lane t's part of an A fragment row: entries t
+// (values 4t..4t+3) and 4 + t (16 + 4t..); `d4` is the super-block's d / 4
+__device__ __forceinline__ void dec_iq3xxs(const uint8_t* sm, uint32_t ro, int ib, uint32_t t, const uint32_t* grid,
+                                           float d4, uint32_t& lo, uint32_t& hi, float& dw) {
+    const uint32_t qa = sm[ro + 2 + 8 * ib + t], qb = sm[ro + 6 + 8 * ib + t];
+    const uint32_t w2 = lds32_2a(sm, ro + 66 + 4 * ib);
+    // entry e's signs: bits 4 (e & 1).. of group e / 2 (7 stored bits, the 8th their parity)
+    const uint32_t hn = t & 1, sh = 7 * (t >> 1);
+    const uint32_t sa = (w2 >> sh) & 127u, sb = (w2 >> (sh + 14)) & 127u;
+    lo = signed4(grid[qa], ((sa >> (4 * hn)) & 15u) | (((uint32_t) __popc(sa) & hn) << 3));
+    hi = signed4(grid[qb], ((sb >> (4 * hn)) & 15u) | (((uint32_t) __popc(sb) & hn) << 3));
+    dw = d4 * (float) (2 * (w2 >> 28) + 1);
+}
+// IQ4_NL block at shared offset `bo`: lane t's word of nibbles gives values 4t..4t+3 (low) and 16 + 4t.. (high)
+__device__ __forceinline__ void dec_iq4nl(const uint8_t* sm, uint32_t bo, uint32_t t, const uint32_t (&kv)[4],
+                                          uint32_t& lo, uint32_t& hi, float& dw) {
+    table16(lds32_2a(sm, bo + 2 + 4 * t), kv, lo, hi);
+    dw = half_at(lds16(sm, bo));
+}
+#endif
+
+// A work item: 256 weight rows (gate/up: 128 features, the gate and up rows of 8 features per m16 tile as above; down:
+// 256 outputs) x up to 128 routed rows of one expert (group()'s 64-row tiles in pairs).  8 warps, warp w: weight rows
+// 32 w.. (two m16 tiles) x all the item's routed rows (16 n8 tiles).  Along K: chunks of 128 values (the activations:
+// codes and d_x per 32, two stages) and units of raw weight bytes (an IQ3_XXS super-block = two chunks, or four IQ4_NL
+// blocks = one chunk, two buffers), one barrier per chunk.
+constexpr int V2_THREADS = 256;
+constexpr int V2_WR = 256;                                  // weight rows per item
+constexpr int V2_NR = 128;                                  // routed rows per item
+constexpr int V2_CSTR = 144;                                // bytes per routed row of a chunk: 128 codes + 16
+constexpr int V2_ACT = V2_NR * V2_CSTR + 4 * V2_NR * 4;     // a chunk: codes [NR][CSTR], then d_x [4][NR]
+constexpr int V2_PF = 2;                                    // raw units into L2 ahead
+static_assert(V2_THREADS == V2_WR, "a thread per weight row for the L2 prefetches");
+template <bool GU> struct V2 {
+    static constexpr int K = GU ? GU_ROWS_K : D_ROWS_K;
+    static constexpr int NC = K / 128;                      // chunks
+    static constexpr int RB = GU ? 98 : 72;                 // raw bytes of a row per unit
+    static constexpr int CPR = GU ? 2 : 1;                  // chunks per unit
+    static constexpr int NU = NC / CPR;
+    // bytes per row of a raw buffer: >= 14 + RB (the offset within 16), a multiple of 16, 28 words (rows g = 0..7
+    // of a decode load fall in distinct banks)
+    static constexpr int SLOT = 112;
+    static constexpr int NP = SLOT / 16;
+    static constexpr int NFB = (GU ? 1280 : 2560) / V2_WR;  // items per routed-row pair of tiles
+    static constexpr int ACT_LD = K / 64 * AB;              // bytes per activation row (a token, or a row of H)
+    static constexpr int OFF_RAW = 2 * V2_ACT;
+    static constexpr int RAWBUF = V2_WR * SLOT;
+    static constexpr int OFF_SROW = OFF_RAW + 2 * RAWBUF;
+    static constexpr int OFF_GRID = OFF_SROW + V2_NR * 4;
+    static constexpr int OFF_MISC = OFF_GRID + (GU ? 1024 : 0);
+    static constexpr int SMEM = OFF_MISC + 16;
+    static_assert(SLOT >= 14 + RB && SLOT % 16 == 0 && NC % CPR == 0, "v2 layout");
+    static_assert(V2_WR * NP % V2_THREADS == 0 && V2_NR * 12 % V2_THREADS == 0, "v2 copy loops");
+    static_assert(8 * V2_NR * 4 <= V2_ACT, "the H scale exchange fits in a chunk stage");
+};
+// the header's numbers (the patch guard reads them there) are these kernels'
+static_assert(GU_ROWS_K == kV2Embd && D_ROWS_K == kV2FF, "moe_fused_iq.hpp: kV2Embd / kV2FF");
+static_assert(V2<true>::SMEM == kV2SharedBytes && V2<false>::SMEM <= kV2SharedBytes, "moe_fused_iq.hpp: kV2SharedBytes");
+static_assert((int) sizeof(block_iq3_xxs) == V2<true>::RB && 4 * (int) sizeof(block_iq4_nl) == V2<false>::RB,
+              "v2: the raw units");
+
+// GU: IQ3_XXS gate/up against the tokens' activations, SwiGLU, H to int8 per 32 features into `out`.  !GU: IQ4_NL
+// down against H, FP32 into `dm`.  `ctr`: the launch's item counter, zero at the start.
+template <bool GU>
+__global__ void __launch_bounds__(V2_THREADS, 1)
+v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* __restrict__ act,
+          const int32_t* __restrict__ src, uint8_t* __restrict__ out, float* __restrict__ dm, int* __restrict__ ctr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    using C = V2<GU>;
+    extern __shared__ __align__(16) uint8_t smem[];
+    int* srow = (int*) (smem + C::OFF_SROW);                   // the activation row of each routed row
+    int* misc = (int*) (smem + C::OFF_MISC);                   // [0] an item, [1] the next item
+    [[maybe_unused]] const uint32_t* sgrid = (const uint32_t*) (smem + C::OFF_GRID);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2;
+    const uint32_t t = lane & 3;
+    if constexpr (GU) {
+        const uint32_t* gs = (const uint32_t*) iq3xxs_grid;
+        for (int i = tid; i < 256; i += V2_THREADS) ((uint32_t*) (smem + C::OFF_GRID))[i] = gs[i];
+    }
+    [[maybe_unused]] uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (!GU) {
+#pragma unroll
+        for (int k = 0; k < 16; ++k) kv[k >> 2] |= (uint32_t) (uint8_t) kvalues_iq4nl[k] << (8 * (k & 3));
+    }
+    const int t0 = tb.ts[b.e0], nwork = (tb.ts[b.e1] - t0) * C::NFB;
+    // ldsm4 of a pair of n8 tiles: lanes 0-7 tile 2p bytes 0-15, 8-15 tile 2p bytes 16-31, 16-31 the same of 2p + 1
+    const int b_lane = ((lane & 7) + 8 * (lane >> 4)) * V2_CSTR + 16 * ((lane >> 3) & 1);
+    // local weight row r of item block f: gate/up - feature 128 f + 8 (r >> 4) + (r & 7), its up row when bit 3 is set
+    auto row_ptr = [&](const uint8_t* bl, int f, int r) -> const uint8_t* {
+        if constexpr (GU)
+            return bl + ((r & 8) ? geo.up_off : 0) + (size_t) (128 * f + 8 * (r >> 4) + (r & 7)) * geo.gu_row;
+        else
+            return bl + geo.down_off + (size_t) (V2_WR * f + r) * geo.d_row;
+    };
+    auto prefetch_unit = [&](const uint8_t* p, int u) {   // a unit spans at most two lines
+        pf_l2(p + u * C::RB);
+        pf_l2(p + u * C::RB + C::RB - 1);
+    };
+
+    if (tid == 0) misc[0] = atomicAdd(ctr, 1);
+    __syncthreads();                                            // misc[0], the codebook
+    int w = misc[0];
+    while (w < nwork) {
+        const int2 tl = tb.tiles[t0 + w / C::NFB];
+        const int fb = w % C::NFB, e = tl.x, row0 = tl.y;
+        if (((row0 - tb.off[e]) & (V2_NR - 1)) != 0) {         // the second tile of an item: the next one
+            __syncthreads();                                    // every thread has read misc[0]
+            if (tid == 0) misc[0] = atomicAdd(ctr, 1);
+            __syncthreads();
+            w = misc[0];
+            continue;
+        }
+        const int nrows = min(V2_NR, tb.off[e + 1] - row0), npairs = (nrows + 15) >> 4;
+        const uint8_t* blob = b.blob[e - b.e0];
+        int nxt = 0;
+        if (tid == 0) nxt = atomicAdd(ctr, 1);                  // the next item, read after the first chunk
+        if (tid < V2_NR) srow[tid] = tid < nrows ? (GU ? src[row0 + tid] : row0 + tid) : 0;
+        // this lane's weight rows (m tile i, half hh: local row 32 warp + 16 i + 8 hh + g): their offset within 16
+        uint32_t lo4[2][2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int hh = 0; hh < 2; ++hh)
+                lo4[i][hh] = (uint32_t) (uintptr_t) row_ptr(blob, fb, 32 * warp + 16 * i + 8 * hh + g) & 15u;
+        const uint8_t* myrow = row_ptr(blob, fb, tid);
+        __syncthreads();                                        // srow
+
+        auto load_raw = [&](int u) {                            // unit u of every row into buffer u & 1
+            const int dst = C::OFF_RAW + (u & 1) * C::RAWBUF;
+#pragma unroll
+            for (int k = 0; k < V2_WR * C::NP / V2_THREADS; ++k) {
+                const int idx = tid + k * V2_THREADS, r = idx / C::NP, p = idx - r * C::NP;
+                const uint8_t* a = row_ptr(blob, fb, r) + u * C::RB;
+                const uint32_t mis = (uint32_t) (uintptr_t) a & 15u;
+                if (p < (int) ((mis + C::RB + 15) >> 4)) cp16(smem + dst + r * C::SLOT + 16 * p, a - mis + 16 * p);
+            }
+        };
+        auto load_act = [&](int c) {                            // chunk c of every routed row into stage c & 1
+            const int so = (c & 1) * V2_ACT;
+#pragma unroll
+            for (int k = 0; k < V2_NR * 12 / V2_THREADS; ++k) {
+                const int idx = tid + k * V2_THREADS, r = idx / 12, p = idx - r * 12;
+                if (r >= nrows) break;
+                const uint8_t* s = act + (size_t) srow[r] * C::ACT_LD + (size_t) (2 * c) * AB;
+                if (p < 8) cp16(smem + so + r * V2_CSTR + 16 * p, s + (p >> 2) * AB + 16 * (p & 3));
+                else cp4(smem + so + V2_NR * V2_CSTR + 4 * ((p - 8) * V2_NR + r),
+                         s + ((p - 8) >> 1) * AB + 64 + 4 * (p & 1));
+            }
+        };
+        load_raw(0);
+        load_act(0);
+        cp_commit();
+#pragma unroll
+        for (int u = 1; u <= V2_PF; ++u)
+            if (u < C::NU) prefetch_unit(myrow, u);
+
+        float acc[2][16][4];
+#pragma unroll
+        for (int i = 0; i < 2; ++i)
+#pragma unroll
+            for (int n = 0; n < 16; ++n)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.0f;
+        uint32_t pr[2][2];                                      // the unit's rows in shared memory
+        [[maybe_unused]] float dd[2][2];                        // IQ3_XXS: the super-block's d / 4
+#pragma unroll 1
+        for (int c = 0; c < C::NC; ++c) {
+            cp_wait<0>();
+            __syncthreads();                                    // chunk c landed; chunk c - 1 is done everywhere
+            if (c + 1 < C::NC) {
+                load_act(c + 1);
+                if ((c + 1) % C::CPR == 0) {
+                    const int u = (c + 1) / C::CPR;
+                    load_raw(u);
+                    if (u + V2_PF < C::NU) prefetch_unit(myrow, u + V2_PF);
+                }
+            }
+            cp_commit();
+            if (c == 1) {                                       // the next item's first units into L2
+                const int wn = misc[1];
+                if (wn < nwork) {
+                    const int2 tn = tb.tiles[t0 + wn / C::NFB];
+                    if (((tn.y - tb.off[tn.x]) & (V2_NR - 1)) == 0) {
+                        const uint8_t* nrow = row_ptr(b.blob[tn.x - b.e0], wn % C::NFB, tid);
+#pragma unroll
+                        for (int u = 0; u < V2_PF; ++u)
+                            if (u < C::NU) prefetch_unit(nrow, u);
+                    }
+                }
+            }
+            if (c % C::CPR == 0) {
+                const int u = c / C::CPR;
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+#pragma unroll
+                    for (int hh = 0; hh < 2; ++hh) {
+                        pr[i][hh] = C::OFF_RAW + (u & 1) * C::RAWBUF + (32 * warp + 16 * i + 8 * hh + g) * C::SLOT +
+                                    ((lo4[i][hh] + u * C::RB) & 15u);
+                        if constexpr (GU) dd[i][hh] = half_at(lds16(smem, pr[i][hh])) * 0.25f;
+                    }
+            }
+            const int so = (c & 1) * V2_ACT;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {                       // the chunk's 32-value sub-blocks
+                // A fragments: {row g lo, row g + 8 lo, row g hi, row g + 8 hi}; per row d_w and -1.5 * 2^23 * d_w
+                uint32_t a[2][4];
+                float dw[2][2], nm[2][2];
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+#pragma unroll
+                    for (int hh = 0; hh < 2; ++hh) {
+                        uint32_t lo, hi;
+                        float d;
+                        if constexpr (GU) dec_iq3xxs(smem, pr[i][hh], 4 * (c & 1) + j, t, sgrid, dd[i][hh], lo, hi, d);
+                        else dec_iq4nl(smem, pr[i][hh] + 18 * j, t, kv, lo, hi, d);
+                        a[i][hh] = lo;
+                        a[i][2 + hh] = hi;
+                        dw[i][hh] = d;
+                        nm[i][hh] = -MAGICF * d;
+                    }
+                const float* sdx = (const float*) (smem + so + V2_NR * V2_CSTR) + j * V2_NR;
+#pragma unroll
+                for (int np = 0; np < 8; ++np) {
+                    if (np >= npairs) break;
+                    uint32_t bq[4];                             // {tile 2np b0, b1, tile 2np + 1 b0, b1}
+                    ldsm4(bq, smem + so + b_lane + np * 16 * V2_CSTR + 32 * j);
+#pragma unroll
+                    for (int nn = 0; nn < 2; ++nn) {
+                        const float2 dx = *(const float2*) (sdx + 16 * np + 8 * nn + 2 * t);
+#pragma unroll
+                        for (int i = 0; i < 2; ++i) {
+                            int d[4];
+                            mma32(d, a[i], bq[2 * nn], bq[2 * nn + 1]);
+                            float* ac = acc[i][2 * np + nn];
+                            // D = 1.5 * 2^23 + dot (rows g, g + 8 x columns 2t, 2t + 1)
+                            ac[0] = __fmaf_rn(__fmaf_rn(__int_as_float(d[0]), dw[i][0], nm[i][0]), dx.x, ac[0]);
+                            ac[1] = __fmaf_rn(__fmaf_rn(__int_as_float(d[1]), dw[i][0], nm[i][0]), dx.y, ac[1]);
+                            ac[2] = __fmaf_rn(__fmaf_rn(__int_as_float(d[2]), dw[i][1], nm[i][1]), dx.x, ac[2]);
+                            ac[3] = __fmaf_rn(__fmaf_rn(__int_as_float(d[3]), dw[i][1], nm[i][1]), dx.y, ac[3]);
+                        }
+                    }
+                }
+            }
+            if (c == 0 && tid == 0) misc[1] = nxt;
+        }
+
+        // columns past nrows hold garbage: they are never written, and no reduction below mixes columns
+        if constexpr (GU) {
+            // SwiGLU of feature 128 fb + 16 warp + 8 i + g; H per routed row and 32 features (warps 2k and 2k + 1):
+            // each warp's max over its 16, exchanged through the chunk stage the last chunk did not use
+            float* sam = (float*) (smem + (C::NC & 1) * V2_ACT);   // [warp][routed row]
+#pragma unroll
+            for (int n = 0; n < 16; ++n)
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    float am = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 2; ++i) {
+                        const float gt = acc[i][n][cc], up = acc[i][n][2 + cc];
+                        const float h = gt / (1.0f + __expf(-gt)) * up;
+                        acc[i][n][cc] = h;
+                        am = fmaxf(am, fabsf(h));
+                    }
+#pragma unroll
+                    for (int o = 4; o < 32; o <<= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+                    acc[0][n][2 + cc] = am;
+                    if (g == 0) sam[warp * V2_NR + 8 * n + 2 * t + cc] = am;
+                }
+            __syncthreads();
+            const int blk = 4 * fb + (warp >> 1), hh = blk & 1;
+#pragma unroll
+            for (int n = 0; n < 16; ++n)
+#pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int r = 8 * n + 2 * (int) t + cc;
+                    const float am = fmaxf(acc[0][n][2 + cc], sam[(warp ^ 1) * V2_NR + r]);
+                    if (r < nrows) {
+                        const float inv = am > 0.0f ? 127.0f / am : 0.0f;
+                        uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (blk >> 1) * AB;
+#pragma unroll
+                        for (int i = 0; i < 2; ++i)
+                            o[32 * hh + 16 * (warp & 1) + 8 * i + g] =
+                                (uint8_t) (int8_t) __float2int_rn(acc[i][n][cc] * inv);
+                        if ((warp & 1) == 0 && g == 0) *(float*) (o + 64 + 4 * hh) = am / 127.0f;
+                    }
+                }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int n = 0; n < 16; ++n)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int r = 8 * n + 2 * (int) t + (q & 1);
+                        if (r < nrows)
+                            dm[(size_t) (row0 + r) * 2560 + V2_WR * fb + 32 * warp + 16 * i + 8 * (q >> 1) + g] =
+                                acc[i][n][q];
+                    }
+        }
+        __syncthreads();                                        // the item is done with every buffer; misc[1]
+        w = misc[1];
+    }
+#endif
+}
+#endif  // !__HIPCC__ (v2)
+
 #if defined(__HIPCC__)
 // ---- Aurora (S23): the native packs' fused experts on gfx11 (RDNA3 / RDNA3.5) matrix cores, v_wmma_i32_16x16x16_iu8
 // (wave32).  The CUDA kernel's arithmetic: a 32-value sub-block decoded to int8 (load_unit / convert above) and its
@@ -1190,6 +1568,7 @@ struct DevInfo {
     bool t75 = false;   // Turing (STRATA_PF_FUSED_SM75): the Q2_0 / Q2_0 layers only (what was set up and checked there)
     bool s120 = false;  // compute capability 12.0 (sm120_series.hpp): the default for the formats measured there
     int sms = 0, occ = 1;
+    int v2 = -1, v2_occ = 1;   // STRATA_PREFILL_V2's kernels: -1 not set up yet, 0 not on this device, 1 ready
 };
 std::mutex g_mu;
 DevInfo g_dev[32];
@@ -1221,6 +1600,23 @@ template <int T, bool GU, int WW> bool setup_ww(int& occ) {
     return true;
 }
 template <int T, bool GU> bool setup_one(int& occ) { return setup_ww<T, GU, 4>(occ) && setup_ww<T, GU, 2>(occ); }
+// the v2 kernels (adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc): device code of sm_80+, their
+// shared memory, at least one block per SM.  "" or why not.
+template <bool GU> const char* setup_v2(int& occ) {
+    cudaFuncAttributes fa{};
+    if (cudaFuncGetAttributes(&fa, v2_kernel<GU>) != cudaSuccess || fa.ptxVersion < 80)
+        return "no sm_80+ device code for them in this build";
+    if (cudaFuncSetAttribute(v2_kernel<GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, V2<GU>::SMEM) != cudaSuccess)
+        return "their shared memory is not available";
+    int o = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&o, v2_kernel<GU>, V2_THREADS, V2<GU>::SMEM) != cudaSuccess ||
+        o < 1)
+        return "not one block fits a multiprocessor";
+    occ = std::min(occ, o);
+    std::fprintf(stderr, "strata: prompt experts, v2 %s kernel: %d registers, %zu bytes local, %d bytes shared, %d "
+                         "block(s) per SM\n", GU ? "gate/up" : "down", fa.numRegs, (size_t) fa.localSizeBytes, V2<GU>::SMEM, o);
+    return "";
+}
 #endif
 
 #if defined(__HIPCC__)
@@ -1386,7 +1782,91 @@ int pick_ww(int64_t n, int n_expert) {
     return avg > 56.0 && avg <= 112.0 ? 2 : 4;
 }
 
+// ---- STRATA_PREFILL_V2 (moe_fused_iq.hpp; the kernels: the v2 section above, adapted from Basalt (MIT),
+// src/prefill/moe_fused_iq.cu at d9915bbc)
+std::atomic<int> g_v2_override{-1};
+int v2_env() {   // read once: the first use comes after the patch guards (generate.cpp), which may set it to 0
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_PREFILL_V2");
+        const int m = v != nullptr ? std::atoi(v) : 0;
+        return m >= 1 && m <= 3 ? m : 0;
+    }();
+    return env;
+}
+#if !defined(__HIPCC__)
+// the v2 kernels' blocks per SM when they are asked for and run on the current device, else 0 (one line per device
+// that keeps the kernels above, saying why)
+int v2_occ() {
+    if (native_v2_mode() == 0) return 0;
+    const DevInfo& di = dev_info();
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lk(g_mu);
+    DevInfo& d = g_dev[dev & 31];
+    if (d.v2 < 0) {
+        d.v2 = 0;
+        int major = 0, smem = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        major = strata::cc_major_of(major);   // STRATA_EMULATE_CC counts (tests), as in dev_info()
+        smem = strata::smem_optin_of(smem);
+        const char* why = "";
+        char buf[96];
+        if (!di.ok || di.t75) why = "the native fused kernels are not set up here";
+        else if (major < 8) why = "compute capability below 8.0";
+        else if (smem < kV2SharedBytes) {
+            std::snprintf(buf, sizeof buf, "%d bytes of shared memory per block, they need %d", smem, kV2SharedBytes);
+            why = buf;
+        }
+        int occ = 1 << 20;
+        if (!*why) why = setup_v2<true>(occ);
+        if (!*why) why = setup_v2<false>(occ);
+        if (!*why) {
+            d.v2 = 1;
+            d.v2_occ = occ;
+        } else {
+            std::fprintf(stderr, "strata: STRATA_PREFILL_V2: the v2 prompt expert kernels do not run on device %d (%s); "
+                                 "the current kernels stay\n", dev, why);
+        }
+        cudaGetLastError();
+    }
+    return d.v2 == 1 ? d.v2_occ : 0;
+}
+// the v2 kernels' two item counters (gate/up, down), past the grouping tables: group_bytes() leaves kV2CounterBytes
+// for them when v2 is asked for
+int* v2_counters(const void* scratch, int64_t n, int n_expert) {
+    const size_t tiles = (size_t) (n + kTileRows - 1) / kTileRows + (size_t) n_expert;
+    const size_t at = (tiles_at(n_expert) + tiles * sizeof(int2) + 15) / 16 * 16;
+    static_assert(15 + 2 * sizeof(int) <= kV2CounterBytes, "the counters fit the bytes group_bytes() adds");
+    return (int*) ((uint8_t*) const_cast<void*>(scratch) + at);
+}
+template <bool GU>
+void launch_v2(unsigned grid, const Batch& b, const NativeGeom& g, const Tables& tb, const void* act,
+               const int32_t* src, void* out, float* dm, int* ctr, cudaStream_t s) {
+    v2_kernel<GU><<<grid, V2_THREADS, V2<GU>::SMEM, s>>>(b, g, tb, (const uint8_t*) act, src, (uint8_t*) out, dm, ctr);
+}
+#endif
+
 }  // namespace
+
+int native_v2_mode() {
+    const int o = g_v2_override.load();
+    return o >= 0 ? (o <= 3 ? o : 0) : v2_env();
+}
+bool native_v2_requested() { return native_v2_mode() != 0; }
+void native_v2_override(int mode) { g_v2_override.store(mode); }
+#if !defined(__HIPCC__)
+bool native_v2_built() { return true; }
+bool native_v2_ready() { return v2_occ() > 0; }
+bool native_v2_takes(int type, bool gate_up) {
+    const int m = native_v2_mode();
+    return gate_up ? (m == 1 || m == 2) && type == T_IQ3_XXS : (m == 1 || m == 3) && type == T_IQ4_NL;
+}
+#else
+bool native_v2_built() { return false; }
+bool native_v2_ready() { return false; }
+bool native_v2_takes(int, bool) { return false; }
+#endif
 
 bool native_supported(int gu_type, int d_type) {
     static const bool off = [] {   // STRATA_PF_FUSED_NATIVE=0: the native packs keep MMQ under STRATA_PF_FUSED=1 (A/B)
@@ -1527,7 +2007,27 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
     const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (1280 / weight_rows(ww)), (int64_t) d.sms * d.occ);
     const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (2560 / weight_rows(ww)), (int64_t) d.sms * d.occ);
-    switch (g.gu_type) {
+    // STRATA_PREFILL_V2 (adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc): IQ3_XXS gate/up and IQ4_NL
+    // down on the v2 kernels, each on its own (H is the same int8 layout either way).  Off (the default): nothing here
+    // runs but the type test and native_v2_mode()'s cached read, and the launches below are today's.  (A HIP build
+    // compiles this tail too, unreached: v2 is not in it.)
+    bool v2_gu = false, v2_d = false;
+#if !defined(__HIPCC__)
+    int occ2 = 0;
+    int* ctr = nullptr;
+    if ((g.gu_type == T_IQ3_XXS || g.d_type == T_IQ4_NL) && native_v2_requested() && (occ2 = v2_occ()) > 0) {
+        v2_gu = native_v2_takes(g.gu_type, true);
+        v2_d = native_v2_takes(g.d_type, false);
+        if (v2_gu || v2_d) {
+            ctr = v2_counters(scratch, n, n_expert);
+            ck(cudaMemsetAsync(ctr, 0, 2 * sizeof(int), s), "v2 counters");
+        }
+    }
+    if (v2_gu)
+        launch_v2<true>((unsigned) std::min<int64_t>(tiles * V2<true>::NFB, (int64_t) d.sms * occ2), b, g, tb, xa, src, ha,
+                        nullptr, ctr, s);
+#endif
+    if (!v2_gu) switch (g.gu_type) {
         case T_IQ2_XXS: launch<T_IQ2_XXS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_IQ2_XS: launch<T_IQ2_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_IQ2_S: launch<T_IQ2_S, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
@@ -1536,8 +2036,15 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         case T_Q2_0: launch<T_Q2_0, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
     }
-    if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
-    else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+#if !defined(__HIPCC__)
+    if (v2_d)
+        launch_v2<false>((unsigned) std::min<int64_t>(tiles * V2<false>::NFB, (int64_t) d.sms * occ2), b, g, tb, ha, src,
+                         nullptr, dm, ctr + 1, s);
+#endif
+    if (!v2_d) {
+        if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+        else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+    }
     ck(cudaGetLastError(), "experts_native");
 }
 

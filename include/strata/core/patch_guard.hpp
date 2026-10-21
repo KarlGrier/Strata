@@ -26,9 +26,14 @@ struct ModelFacts {
     bool ple_table = false, gdn = false, qsa = false;
     std::vector<std::string> bad_dense;    // 2-D dense weights in a B.3 format whose row length is not a multiple of 256
     std::vector<std::string> expert_types; // the routed experts' gate/up and down formats, "gate/down" per distinct pair
+    /// STRATA_PREFILL_V2 asked for (1..3): the visible CUDA devices its v2 prompt expert kernels run on (compute capability
+    /// 8.0+, their shared memory per block; 0 in a build that is not CUDA).  -1: not probed (not asked for - no device
+    /// query on the default path).
+    int gpus_v2 = -1;
 };
 
-/// Reads the facts; `mtp_dir` may be empty (no drafter).  Throws only when the header cannot be read.
+/// Reads the facts; `mtp_dir` may be empty (no drafter).  Throws only when the header cannot be read.  (The one fact
+/// that is not the model's, gpus_v2, is read only when STRATA_PREFILL_V2 asks for it.)
 ModelFacts read_model_facts(const std::vector<std::string>& native_shards, const std::string& mtp_dir);
 
 /// The guards: logs a summary line (and one line per mismatch), turns failed patches off.  Returns the number off.

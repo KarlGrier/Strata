@@ -39,4 +39,35 @@ void quantize_act_native(const float* x, int64_t rows, int64_t cols, void* xa, v
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);
 
+// ---- v2 (adapted from Basalt (MIT), src/prefill/moe_fused_iq.cu at d9915bbc; see moe_fused_iq.cu's v2 section)
+//
+// STRATA_PREFILL_V2 (read once, at the first use - after the patch guards, which may set it to 0): unset or 0 = off,
+// experts_native() runs exactly the kernels above; 1 = IQ3_XXS gate/up and IQ4_NL down on the v2 kernels (raw weight
+// bytes by cp.async, decoded straight into the mma fragments, a warp per 32 weight rows x up to 128 routed rows, an
+// atomic item queue); 2 = gate/up only, 3 = down only (to tell the two apart in an A/B).  Every other format, and a
+// device the v2 kernels do not run on (below sm_80, too little shared memory, no device code), keeps the kernels above.
+// The same math as the kernels above, each 32-value term rounded in another order: see moe_fused_iq.cu.
+
+/// The v2 kernels' compiled shapes: K of gate/up (n_embd) and of down (the experts' n_ff), and the dynamic shared memory
+/// of the larger one (gate/up; down needs 1,024 bytes less).  The patch guard compares them with the model and the GPUs.
+constexpr int kV2Embd = 2560, kV2FF = 640;
+constexpr int kV2SharedBytes = 99856;
+/// The bytes group_bytes() adds past the grouping tables for the v2 item counters, when v2 is asked for.  A buffer that
+/// was sized while v2 was off and then runs it under native_v2_override() (the tests) adds them itself.
+constexpr size_t kV2CounterBytes = 64;
+
+/// The request: 0 off, 1 both, 2 gate/up only, 3 down only (native_v2_override() if set, else STRATA_PREFILL_V2).
+int native_v2_mode();
+/// native_v2_mode() != 0.  No device work.
+bool native_v2_requested();
+/// This build has the v2 kernels (a CUDA build; HIP and the stubs: false).
+bool native_v2_built();
+/// Requested, and the v2 kernels run on the current device (set up once per device; a device they do not run on gets
+/// one log line and the kernels above).
+bool native_v2_ready();
+/// The v2 kernels would take this format for gate/up (`gate_up`) or down under the current request.
+bool native_v2_takes(int type, bool gate_up);
+/// Tests: 0..3 force a mode, -1 returns to STRATA_PREFILL_V2.
+void native_v2_override(int mode);
+
 }  // namespace strata::prefill::fused

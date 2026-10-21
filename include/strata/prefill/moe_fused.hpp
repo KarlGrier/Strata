@@ -39,7 +39,8 @@ bool requested();
 /// Bytes of `rows` activation rows of `cols` values (a multiple of 64) in the kernels' int8 form: per 64 values 64
 /// codes and {d, c} of each half (c = -(1.5 * 2^23 + the half's code sum), what the epilogue adds back).
 size_t act_bytes(int64_t rows, int64_t cols);
-/// Bytes of the grouping tables for `n` routed rows over `n_expert` experts.
+/// Bytes of the grouping tables for `n` routed rows over `n_expert` experts (+ kV2CounterBytes when STRATA_PREFILL_V2
+/// asks for the v2 kernels, moe_fused_iq.hpp: their item counters, past the tables).
 size_t group_bytes(int64_t n, int n_expert);
 
 /// x [rows][cols] FP32 -> `xa` (act_bytes(rows, cols)).

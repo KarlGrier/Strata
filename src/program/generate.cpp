@@ -16870,7 +16870,8 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                        if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                            T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) req_spec_min_p);
                         else
                             while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                     }
@@ -18706,7 +18707,8 @@ int main(int argc, char** argv) {
                 T = std::clamp(chain_rows, 1, S_mtp);
             } else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                    T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) o.spec_min_p);
                 else
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }

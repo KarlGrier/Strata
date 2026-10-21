@@ -1777,11 +1777,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         float pj = ((volatile float*) h_prob_)[0];
         if (probs) probs[0] = pj;
         n = 1;
-        // STRATA_COST_GATE (round 12): the next step runs while the window would keep its draft (cost_gate.hpp)
+        // STRATA_COST_GATE (round 12): the next step runs while the window would keep its draft (cost_gate.hpp; past
+        // the steps its table prices, the window and so the chain go by min_p, as cost_gate_T)
         const strata::spec::CostGate& cg = strata::spec::cost_gate();
         double cg_p = 1.0;
         auto more = [&](int j, float p) {
-            if (!cg.on) return chain_rule_ ? chain_rule_(j - 1, p) : p >= min_p;   // 0.2.7's STRATA_SPEC_COST rule, else --spec-min-p
+            if (!cg.on || j - 1 >= cg.steps()) return chain_rule_ ? chain_rule_(j - 1, p) : p >= min_p;   // 0.2.7's STRATA_SPEC_COST rule, else --spec-min-p
             cg_p *= cg.a(j - 1, p);
             return cg_p >= cg.th(j - 1);
         };

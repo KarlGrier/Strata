@@ -100,6 +100,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/cost_gate.hpp"
+#include "strata/spec/draft_cum.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -9289,6 +9290,44 @@ int main(int argc, char** argv) {
                          ev, v.why.c_str());
         return false;
     };
+    // STRATA_DRAFT_CUM (spec/draft_cum.hpp), once the tiers are final: Basalt's pack factor reads the RAM-served expert
+    // bytes per expert slot - an expert no GPU holds that the RAM copy (or the arena) does.  Adapted from Basalt (MIT),
+    // src/program/generate.cpp at fb0944c7 (report_expert_tiers, draft_cum_cpu_mb).  One line says the rule's numbers.
+    auto draft_cum_place = [&]() {
+        const strata::spec::DraftCumConfig& dc = strata::spec::draft_cum_config();
+        if (!dc.on) return;
+        const bool ram_ok = srcp == &src && src.complement_ready();
+        const bool arena_ok = srcp == &arena_src && arena_src.mapped();
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        uint64_t b_ram = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const uint64_t blob = (uint64_t) lay.blob_bytes(l);
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                bool on_gpu = xcache.slot_of(l, e) >= 0;
+                for (const auto& st : stages) on_gpu = on_gpu || st->cache.slot_of(l, e) >= 0;
+                for (const auto& r : remote_experts) on_gpu = on_gpu || (r.resident() > 0 && r.holds(l, (int32_t) e));
+                if (!on_gpu && peer.valid() && peer.has(l, e)) on_gpu = true;
+                if (!on_gpu && (arena_ok || (ram_ok && src.has_resident(l, e)))) b_ram += blob;
+            }
+        }
+        const int64_t slots = g.n_layers * g.n_expert;
+        strata::spec::draft_cum_cpu_mb() = slots > 0 ? (float) ((double) b_ram / (double) slots / 1e6) : 0.0f;
+        const float k = strata::spec::draft_cum_scale();
+        const strata::spec::CostGate& cg = strata::spec::cost_gate();
+        char steps[96] = "every draft step";
+        if (cg.on && cg.steps() > 0)
+            std::snprintf(steps, sizeof steps, "the cost gate prices draft steps 1-%d, the rule the steps past them",
+                          cg.steps());
+        std::fprintf(stderr, "strata: cumulative draft length ON (STRATA_DRAFT_CUM, adapted from Basalt): a draft stays while "
+                             "the product of the drafts' acceptance estimates is >= the request's threshold, %.3f falling to "
+                             "%.3f while drafts beat the table (base %.3f and floor %.3f x pack factor %.3f%s; %.2f MB of "
+                             "RAM-served experts per slot), adaptation rate %.3f; %s%s%s\n",
+                     (double) (dc.base * k), (double) (std::min(dc.floor, dc.base) * k), (double) dc.base,
+                     (double) dc.floor, (double) k, dc.scale > 0.0f ? " from STRATA_DRAFT_CUM_SCALE" : "",
+                     (double) strata::spec::draft_cum_cpu_mb(), 1.0 - dc.decay, steps,
+                     o.spec_min_p > 0.0 ? "" : "; --spec-min-p 0 keeps every window full, so the rule is not used",
+                     o.pipeline_windows >= 2 ? "; --pipeline-windows 2's windows keep the --spec-min-p rule" : "");
+    };
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -12318,6 +12357,7 @@ int main(int argc, char** argv) {
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        if (use_mtp) draft_cum_place();   // STRATA_DRAFT_CUM: the tiers are final
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
@@ -16159,6 +16199,13 @@ int main(int argc, char** argv) {
             strata::spec::PromptLookupSource lookup_src(sfx);
             static const bool chain_fixed = std::getenv("STRATA_LOOKUP_CHAIN_FIXED") != nullptr;   // no policy gate
             int64_t draft_offered = 0, draft_accepted = 0;
+            // STRATA_DRAFT_CUM (spec/draft_cum.hpp): this request's threshold, and the rule the drafts in `dprob` were
+            // made under (off until the first draft; fixed before each draft, then read by the next window's size)
+            const bool cum_on = use_mtp && strata::spec::draft_cum_config().on;
+            strata::spec::DraftCumAdapt cum_adapt;
+            if (cum_on) cum_adapt.start(strata::spec::draft_cum_config(), strata::spec::draft_cum_scale());
+            strata::spec::DraftCumWindow cum_win;
+            int64_t cum_windows = 0, cum_drafts = 0;   // the request's MTP windows with drafts, and their drafts
             // what the session holds once this request is done: the prompt read so far, then every committed token
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
@@ -16870,7 +16917,8 @@ int main(int argc, char** argv) {
                         T = std::clamp(chain_rows, 1, S_mtp);
                     } else if (use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
-                        if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                        if (cum_win.on) T = strata::spec::draft_cum_T(dprob.data(), S_mtp, cum_win);   // STRATA_DRAFT_CUM
+                        else if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
                             T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) req_spec_min_p);
                         else
                             while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
@@ -17204,6 +17252,18 @@ int main(int argc, char** argv) {
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < lim)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
+                // STRATA_DRAFT_CUM: an MTP window's outcome moves the request's threshold (not a lookup window - its
+                // drafts are not the drafter's - nor a merged first window, whose rows are prompt tokens); the next
+                // window's rule is then fixed before its drafts are made, for the chain and the next window's size
+                if (cum_on) {
+                    if (!from_sfx && !merged && T_mtp > 1) {
+                        cum_adapt.observe(dprob.data(), T_mtp - 1, std::min(a, T_mtp - 1));
+                        ++cum_windows;
+                        cum_drafts += T_mtp - 1;
+                    }
+                    cum_win = strata::spec::draft_cum_window(cum_adapt.th());
+                    mtp.set_draft_cum(true, cum_win.th);
+                }
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 const bool drafted = !use_mtp || eos || produced_n >= lim ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
@@ -17621,12 +17681,20 @@ int main(int argc, char** argv) {
                 std::snprintf(read_txt, sizeof(read_txt), "%lld of %lld", (long long) read_n, (long long) fresh);
             else
                 std::snprintf(read_txt, sizeof(read_txt), "%lld", (long long) fresh);
+            // (the window count and drafts per window are appended last: every field before them keeps its place)
             std::fprintf(stderr, "strata serve: prompt %lld tokens = %lld reused + %s read in %.0f ms (%.1f tok/s), "
-                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s\n",
+                                 "%lld generated in %.0f ms (%.1f tok/s), drafts accepted %lld of %lld, %zu checkpoints%s, "
+                                 "%lld windows, %.2f drafts per window\n",
                          (long long) n, (long long) resume, read_txt, prompt_ms,
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
-                         (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+                         (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "", (long long) dec_windows,
+                         dec_windows > 0 ? (double) draft_offered / (double) dec_windows : 0.0);
+            if (cum_on)
+                std::fprintf(stderr, "strata serve: cumulative draft length (STRATA_DRAFT_CUM): %lld MTP windows with drafts, "
+                                     "%.2f drafts per MTP window; threshold %.3f at the end (started at %.3f)\n",
+                             (long long) cum_windows, cum_windows > 0 ? (double) cum_drafts / (double) cum_windows : 0.0,
+                             (double) cum_adapt.th(), (double) cum_adapt.base);
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);
@@ -18558,6 +18626,16 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: --spec-follow replaces outputs before acceptance (teacher-forced diagnostic, not sampling-law evidence)\n");
         strata::core::MtpDrafter::DraftResult generation;
         strata::core::gated::Packet proposal;
+        // STRATA_DRAFT_CUM (spec/draft_cum.hpp): the run's threshold and the rule its drafts were made under (as serve)
+        const bool cum_on = use_mtp && strata::spec::draft_cum_config().on;
+        if (cum_on) draft_cum_place();
+        strata::spec::DraftCumAdapt cum_adapt;
+        if (cum_on) cum_adapt.start(strata::spec::draft_cum_config(), strata::spec::draft_cum_scale());
+        strata::spec::DraftCumWindow cum_win;
+        if (cum_on) {
+            cum_win = strata::spec::draft_cum_window(cum_adapt.th());
+            mtp.set_draft_cum(true, cum_win.th);
+        }
         {   // Non-native prefill already emitted x; draft_first(cell=p-1) samples at p.
             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p, o.max_context);
             if (use_mtp && !first_window &&
@@ -18707,7 +18785,8 @@ int main(int argc, char** argv) {
                 T = std::clamp(chain_rows, 1, S_mtp);
             } else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
-                if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                if (cum_win.on) T = strata::spec::draft_cum_T(dprob.data(), S_mtp, cum_win);   // STRATA_DRAFT_CUM
+                else if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
                     T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) o.spec_min_p);
                 else
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
@@ -18872,6 +18951,11 @@ int main(int argc, char** argv) {
                 break;
             }
             generation = {};
+            if (cum_on) {   // STRATA_DRAFT_CUM: as in serve - an MTP window moves the threshold, then the next rule is fixed
+                if (!from_sfx && T_mtp > 1) cum_adapt.observe(dprob.data(), T_mtp - 1, std::min(a, T_mtp - 1));
+                cum_win = strata::spec::draft_cum_window(cum_adapt.th());
+                mtp.set_draft_cum(true, cum_win.th);
+            }
             const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
             const bool drafted = !use_mtp || (int64_t) produced.size() >= max_new || draft_next(T, a);
             if (adapt_thr.joinable()) adapt_thr.join();
@@ -18922,6 +19006,9 @@ int main(int argc, char** argv) {
             for (size_t i = 1; i < window_hist.size(); ++i) std::printf(" T%zu:%lld", i, (long long) window_hist[i]);
             std::printf("  (min draft probability %.2f)\n", o.spec_min_p);
         }
+        if (cum_on)
+            std::printf("%-24s threshold %.3f at the end (started at %.3f)\n", "cumulative draft length",
+                        (double) cum_adapt.th(), (double) cum_adapt.base);
         if (o.suffix_draft > 0)
             std::printf("%-24s %lld windows, drafts accepted %lld of %lld\n", "suffix drafts", (long long) sfx_windows,
                         (long long) sfx_ok, (long long) sfx_drafts);

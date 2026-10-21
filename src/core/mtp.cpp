@@ -5,6 +5,7 @@
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/spec/cost_gate.hpp"
+#include "strata/spec/draft_cum.hpp"
 #include "strata/core/spec_exact.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
@@ -1728,7 +1729,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         // the steps its table prices, the window and so the chain go by min_p, as cost_gate_T)
         const strata::spec::CostGate& cg = strata::spec::cost_gate();
         double cg_p = 1.0;
+        // STRATA_DRAFT_CUM (spec/draft_cum.hpp): the next step runs while the window keeps the draft before it by the
+        // cumulative rule - the same function over the same probabilities, in the same order, as the window size
+        const strata::spec::DraftCumWindow cw =
+            cum_on_ ? strata::spec::draft_cum_window(cum_th_) : strata::spec::DraftCumWindow{};
+        float cpr[strata::kernels::kVerifyMaxT] = {};
+        cpr[0] = pj;
         auto more = [&](int j, float p) {
+            if (cw.on) return j - 1 < strata::kernels::kVerifyMaxT && strata::spec::draft_cum_keep(cpr, j - 1, cw);
             if (!cg.on || j - 1 >= cg.steps()) return p >= min_p;
             cg_p *= cg.a(j - 1, p);
             return cg_p >= cg.th(j - 1);
@@ -1750,6 +1758,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             pj = ((volatile float*) h_prob_)[j];
             if (probs) probs[j] = pj;
+            if (j < strata::kernels::kVerifyMaxT) cpr[j] = pj;
             ++n;
         }
         prefetch_ple(drafts[n - 1]);

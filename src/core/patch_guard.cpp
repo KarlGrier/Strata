@@ -169,6 +169,20 @@ int run_patch_guards(const ModelFacts& f) {
              return "";
          },
          [] { setenv_off("STRATA_GR_FORK", "0"); }},
+        // STRATA_DRAFT_CUM (spec/draft_cum.hpp): it sizes windows from the MTP drafter's per-draft raw probabilities
+        // with Basalt's acceptance table and pack-factor range, both measured on Qwen3.8-Flash-Next's drafter
+        // (qwen4exp).  Another family's drafter is not what the table describes, and an empty draft vocabulary gives no
+        // probabilities to read: the switch goes off, and the cost gate / --spec-min-p size the windows as without it.
+        // (Without --mtp the switch has nothing to size; the check still runs.)
+        {"draft_cum", "the cumulative, per-request adaptive draft length (Basalt's table)", "STRATA_DRAFT_CUM=0",
+         [](const ModelFacts& m) -> std::string {
+             if (m.arch != "qwen4exp")
+                 return "architecture " + (m.arch.empty() ? std::string("?") : m.arch) +
+                        "; its acceptance table was measured on the qwen4exp (Qwen3.8-Flash-Next) drafter";
+             if (m.draft_vocab == 0) return "the drafter's draft_vocab.bin is empty";
+             return "";
+         },
+         [] { setenv_off("STRATA_DRAFT_CUM", "0"); }},
     };
     const bool list = std::getenv("STRATA_GUARD_LIST") != nullptr && std::atoi(std::getenv("STRATA_GUARD_LIST")) != 0;
     int off = 0;

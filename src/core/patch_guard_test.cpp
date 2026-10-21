@@ -20,7 +20,7 @@ using strata::core::ModelFacts;
 
 namespace {
 const char* kSwitches[] = {"STRATA_SPEC_EXACT", "STRATA_SIDE_MIXER", "STRATA_ROUTER_Q8K",
-                           "STRATA_QSA_SPLIT_ATTN", "STRATA_MMVQ_IL", "STRATA_GR_FORK"};
+                           "STRATA_QSA_SPLIT_ATTN", "STRATA_MMVQ_IL", "STRATA_GR_FORK", "STRATA_DRAFT_CUM"};
 
 void reset() {
     for (const char* s : kSwitches) setenv(s, "1", 1);
@@ -86,6 +86,9 @@ int main(int argc, char** argv) {
         // of 256
         {"n_embd 3072", [](ModelFacts& m) { m.n_embd = 3072; }, "STRATA_GR_FORK"},
         {"n_embd 2600 (not a multiple of 256)", [](ModelFacts& m) { m.n_embd = 2600; }, "STRATA_ROUTER_Q8K"},
+        // the cumulative draft length's table is the qwen4exp drafter's
+        {"architecture qwen35moe", [](ModelFacts& m) { m.arch = "qwen35moe"; }, "STRATA_DRAFT_CUM"},
+        {"an empty draft vocabulary", [](ModelFacts& m) { m.draft_vocab = 0; }, "STRATA_DRAFT_CUM"},
     };
     for (const Case& c : cases) {
         ModelFacts m = real;

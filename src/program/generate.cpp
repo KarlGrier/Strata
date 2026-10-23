@@ -9195,6 +9195,9 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // keep=1 (local, 2026-10-21): the live session of a ckpt=0 request, kept only for the server's own continuation
+        // of it (see req_keep); the next request that does not extend it drops it
+        bool live_transient = false;
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         std::vector<ConvCheckpoint> checks;
@@ -12305,6 +12308,7 @@ int main(int argc, char** argv) {
                     for (const ConvCheckpoint& c : checks) check_clock = std::max(check_clock, c.used);
                     cvec_cached = image.cvec;
                     live_ok = true;
+                    live_transient = false;   // keep=1: a restored session is a whole conversation again
                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
                         nan_flush = false;
                         const size_t n_parked = conversations.clear() + chat_parked.size();   // --chat-cache's too
@@ -12344,6 +12348,17 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            // keep=1 (local, 2026-10-21): with ckpt=0, still keep this request's live session for the server's own
+            // continuation of it - a reasoning budget / answer_room closes the thinking in a second pass whose prompt is
+            // this one plus what was generated plus the wrap-up.  No checkpoint is taken and it is never parked: the
+            // next request either extends it (the continuation) or drops it at its start.  Without it every such
+            // continuation re-read the prompt and the whole thinking (phase 4: 31 of 32 on 8080, ~11 s each).
+            int req_keep = 0;
+            // tcap=N tend=ID (local, 2026-10-23): the server's thinking budget - this request stops after N tokens unless
+            // it has handed out the token ID (</think>) by then, which lifts the cap back to max_new.  The server's STOP
+            // at the budget came in the middle of a speculative window, and the session then held tokens past the point
+            // its continuation (the wrap-up) goes on from; stopped here, the session ends exactly there.
+            long long req_tcap = 0, req_tend = -1;
             std::string req_owner, req_chat_drop;   // the conversation cache's owner tag / drop (see live_owner)
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
@@ -12375,6 +12390,9 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "keep") req_keep = std::atoi(tok.c_str() + eq + 1) != 0;
+                    else if (key == "tcap") req_tcap = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                    else if (key == "tend") req_tend = std::atoll(tok.c_str() + eq + 1);
                     else if (key == "owner") req_owner = tok.substr(eq + 1);
                     else if (key == "chat_drop") req_chat_drop = tok.substr(eq + 1);
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
@@ -12623,6 +12641,15 @@ int main(int argc, char** argv) {
                                      "token 0\n", n_checks, n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s",
                              n_chat, n_chat == 1 ? "" : "s", n_slots, n_slots == 1 ? "" : "s", n_running,
                              n_running == 1 ? "" : "s");
+            }
+            // keep=1: a kept one-shot session is for its own continuation only - any other request drops it here (never
+            // parked, no checkpoint), as ckpt=0 always did
+            if (live_transient) {
+                live_transient = false;
+                if (live_ok && !starts_with(live, live_imgs)) {
+                    live_ok = false;
+                    std::fprintf(stderr, "strata serve: the kept one-shot session (keep=1) was not continued: dropped\n");
+                }
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -14291,6 +14318,8 @@ int main(int argc, char** argv) {
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            // tcap: the serial loop below hands out at most `lim` tokens; the </think> token (tend) lifts it to max_new
+            int64_t lim = req_tcap > 0 && req_tend >= 0 ? std::min<int64_t>(max_new, req_tcap) : max_new;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -14347,7 +14376,8 @@ int main(int argc, char** argv) {
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
-                                  : mtp.coupled() ? "coupled draft sampling" : nullptr;
+                                  : mtp.coupled() ? "coupled draft sampling"
+                                  : lim < max_new ? "a thinking budget (tcap)" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
                 if (said.insert(pl_serial).second)
@@ -14992,7 +15022,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
                 }
             }
-            while (!pl_ran && !cancelled && produced_n < max_new) {
+            while (!pl_ran && !cancelled && produced_n < lim) {
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -15254,8 +15284,11 @@ int main(int argc, char** argv) {
                 int emit = a + 1;
                 if (!commit_all && !merged) {
                     emit = 0;
-                    for (bool end = false; emit <= a && produced_n + emit < max_new && !end; ++emit)
+                    int64_t lim_w = lim;   // tcap: lifted by a </think> this window hands out, as in the loop below
+                    for (bool end = false; emit <= a && produced_n + emit < lim_w && !end; ++emit) {
                         end = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) emit]) != o.eos_ids.end();
+                        if (outv[(size_t) emit] == req_tend) lim_w = max_new;
+                    }
                 }
                 if (!ver.commit(emit, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
@@ -15285,13 +15318,14 @@ int main(int argc, char** argv) {
                 }
                 first_window = false;
                 bool eos = false;
-                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                for (int i = merged ? a : 0; i <= a && produced_n < lim && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
                     if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
                     eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                    if (outv[(size_t) i] == req_tend) lim = max_new;   // tcap: the thinking ended, the cap lifts
                 }
                 std::fflush(stdout);
                 ++rounds;
@@ -15299,7 +15333,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < lim)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 // STRATA_DRAFT_CUM: an MTP window's outcome moves the request's threshold (not a lookup window - its
                 // drafts are not the drafter's - nor a merged first window, whose rows are prompt tokens); the next
@@ -15313,7 +15347,7 @@ int main(int argc, char** argv) {
                     cum_win = strata::spec::draft_cum_window(cum_adapt.th());
                     mtp.set_draft_cum(true, cum_win.th);
                 }
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
+                const bool drafted = !use_mtp || eos || produced_n >= lim ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
                 {
                     const Clock::time_point tw3 = Clock::now();
@@ -15381,7 +15415,8 @@ int main(int argc, char** argv) {
                 // (the checkpoints taken while reading it are still good)
                 live.swap(consumed);
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
-                live_ok = o.prompt_cache > 0 && req_ckpt;   // ckpt=0: nothing to continue or park (#830)
+                live_ok = o.prompt_cache > 0 && (req_ckpt || req_keep);   // ckpt=0: nothing to continue or park (#830)
+                live_transient = live_ok && !req_ckpt;   // keep=1: only for the server's continuation of it
                 if (nf_hit) live_ok = false;   // #879 (the next request's start drops the rest)
             } else if (!nf_hit && pp_exact && pp_reached > 0 && o.prompt_cache > 0 && req_ckpt &&
                        pp_reached <= (int64_t) cur.size()) {

@@ -1682,6 +1682,21 @@ class SamplingKeys(unittest.TestCase):
         for absent in ({}, {"strata_checkpoint": True}, {"strata_checkpoint": 0}, {"cache_prompt": False}):
             self.assertNotIn("ckpt=0", self.keys(**absent), absent)
 
+    def test_keep_live_key(self):
+        # (local, 2026-10-21) keep=1 rides only with ckpt=0, and only when the server itself asks for it
+        self.assertIn("keep=1", self.keys(temperature=0, strata_checkpoint=False, _strata_keep_live=True))
+        for absent in ({"strata_checkpoint": False}, {"_strata_keep_live": True},
+                       {"strata_checkpoint": True, "_strata_keep_live": True}):
+            self.assertNotIn("keep=1", self.keys(**absent), absent)
+
+    def test_think_cap_keys(self):
+        # (local, 2026-10-23) tcap/tend: only the server's own (cap, id) tuple, never a client's list
+        k = self.keys(temperature=0, _strata_think_cap=(20, 151668))
+        self.assertIn("tcap=20", k)
+        self.assertIn("tend=151668", k)
+        for bad in ([20, 151668], (0, 5), (20, -1), (True, 5), (20,)):
+            self.assertNotIn("tcap=", self.keys(_strata_think_cap=bad), bad)
+
     def test_chat_cache_owner_keys(self):
         k = self.keys(temperature=0, strata_owner="research", strata_chat_drop="research")
         self.assertIn("owner=research", k)
@@ -4220,6 +4235,76 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
+
+class CappedThinkingEngine(ThinkingEngine):
+    """ThinkingEngine that obeys the server's thinking cap as the engine does (local, 2026-10-23): it stops after the
+    cap's tokens unless it has handed out </think> (one token) by then.  Records each pass's max_new and cap."""
+
+    def __init__(self, tok):
+        super().__init__(tok)
+        self.passes = []
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        cap = (sampling or {}).get("_strata_think_cap")
+        self.passes.append((max_new, cap))
+        lim, end = (min(max_new, cap[0]), cap[1]) if cap else (max_new, None)
+        done = self.tok.decode(ids).endswith("</think>\n\n")
+        text = self.ANSWER if done else self.THOUGHT + "</think>\n\n" + self.ANSWER
+        for k, t in enumerate(self.tok.encode(text, parse_special=True)
+                              + self.tok.encode("<|im_end|>", parse_special=True)):
+            if k >= lim or cancel.is_set():
+                return
+            yield t
+            if t == end:
+                lim = max_new
+
+
+class ThinkingBudgetCap(unittest.TestCase):
+    """(local, 2026-10-23) under a thinking budget the engine is told where it ends (tcap) and stops there itself, so
+    the wrap-up pass extends exactly the session it left; a pass still gets the rest of max_tokens, so a thinking that
+    ends before the budget answers in the same pass."""
+
+    def setUp(self):
+        self.tok = ThinkTokenizer()
+        self.engine = CappedThinkingEngine(self.tok)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def openai(self, **extra):
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 400, **extra}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode())
+
+    def test_the_engine_stops_at_the_budget_and_the_wrap_up_extends_it(self):
+        from serve.server import REASONING_WRAP_UP
+        code, b = self.openai(reasoning_budget_tokens=20)
+        self.assertEqual(code, 200, b)
+        self.assertEqual(b["choices"][0]["message"]["content"], ThinkingEngine.ANSWER)
+        end = self.tok.encode("</think>", parse_special=True)
+        self.assertEqual(len(end), 1)
+        (max1, cap1), (_, cap2) = self.engine.passes
+        self.assertEqual((max1, cap1, cap2), (400, (20, end[0]), None))     # max_new is not cut to the budget
+        first, second = self.engine.prompts
+        extra = self.tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.assertEqual(second, first + self.tok.encode(ThinkingEngine.THOUGHT[:20]) + extra)
+
+    def test_a_thinking_that_ends_before_the_budget_answers_in_the_same_pass(self):
+        code, b = self.openai(reasoning_budget_tokens=300)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertEqual((msg["reasoning_content"], msg["content"]), (ThinkingEngine.THOUGHT, ThinkingEngine.ANSWER))
+        self.assertEqual(len(self.engine.passes), 1)
+        self.assertEqual(self.engine.passes[0][0], 400)
+        self.assertLess(self.engine.passes[0][1][0], 400)          # (the budget leaves room to answer: 200 here)
 
 
 class ThinkingBudget(unittest.TestCase):

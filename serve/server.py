@@ -1464,6 +1464,17 @@ class StrataEngine:
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
             keys += " ckpt=0"
+            # (local, 2026-10-21) set by the server itself on a reasoning-budget request: the engine keeps this pass's
+            # session for the server's own next pass (the wrap-up and answer) - no checkpoint, never parked, dropped by
+            # any other request.  Not a client field: a request's own copy is dropped before its first pass.
+            if sampling.get("_strata_keep_live"):
+                keys += " keep=1"
+        # (local, 2026-10-23) set by the server itself under a thinking budget: tcap=N tend=ID - the engine stops after N
+        # tokens unless it has handed out the </think> token (ID) by then.  Not a client field (dropped like keep=1's).
+        tc = sampling.get("_strata_think_cap")
+        if isinstance(tc, tuple) and len(tc) == 2 and all(isinstance(v, int) and not isinstance(v, bool) for v in tc) \
+                and tc[0] > 0 and tc[1] >= 0:
+            keys += f" tcap={tc[0]} tend={tc[1]}"
         # (local, 2026-10-19) "strata_owner": "research" tags what this request leaves in the conversation cache;
         # "strata_chat_drop": "research" drops every parked conversation with that tag before the request (a research
         # run's report stage; deep-research's proxy sends both).  A short word only; anything else is not sent.
@@ -5293,6 +5304,9 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if sampling and ("_strata_keep_live" in sampling or "_strata_think_cap" in sampling):
+            # the server's own fields (keep=1, tcap below), never a client's
+            sampling = {k: v for k, v in sampling.items() if k not in ("_strata_keep_live", "_strata_think_cap")}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -5462,13 +5476,29 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    # (local, 2026-10-21) a request with a thinking budget (answer_room, reasoning_budget_tokens) may go on
+                    # in a second pass that extends this one's session: a one-shot call (ckpt=0) keeps it for that
+                    keep_live = bool(budget) and (sampling or {}).get("strata_checkpoint") is False
+                    # (local, 2026-10-23) and the engine stops at the budget itself (tcap: the tokens left to it while
+                    # the thinking is open; its </think> token lifts the cap), so its session ends where the wrap-up goes
+                    # on.  The STOP sent at the budget came in the middle of a speculative window and left tokens past
+                    # that point in the session (gap 7's A/B: 4 of 8 continuations re-read the whole thinking).  A pass
+                    # still gets the rest of max_tokens: a thinking that ends early answers in the same pass.
+                    think_end = self.tok.encode(THINK_END, parse_special=True) if budget else []
                     for ev in opening:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        sampling_pass = {**(sampling or {}), "_strata_keep_live": True} if keep_live else sampling
+                        cap = max(1, budget - thought) if budget and parser.state == "reasoning" \
+                            and len(think_end) == 1 else None
+                        if cap is not None and cap < max_new - n:
+                            sampling_pass = {**(sampling_pass or {}), "_strata_think_cap": (cap, think_end[0])}
+                        else:
+                            cap = None
+                        gen = self.engine.generate(prompt, max_new - n, sampling_pass, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, max_new - n, sampling_pass, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -5649,6 +5679,14 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if cap is not None and not (wrap or opens) and len(seg) == cap and think_end[0] not in seg \
+                                and finish != "stop" and not repeated and not looped and recover_prompt is None \
+                                and not cancel.is_set() and (stops is None or stops.hit is None) and n < max_new:
+                            # the engine stopped at the cap short of a clean point (a tag or a character still open),
+                            # or before the budget (tokens of a call inside the thinking are not counted against it):
+                            # the next pass extends its session
+                            prompt = prompt + seg
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a

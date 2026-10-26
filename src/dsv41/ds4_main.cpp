@@ -351,6 +351,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
+    // (10-26 local) STRATA_DS4_SLOT_RAM_GB: the bytes of the conversations kept in RAM, past which the least recently
+    // used goes to the folder as past STRATA_DS4_SLOT_CAP (0 or unset: no byte cap)
+    const uint64_t slot_ram_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_RAM_GB", 0) * 1073741824.0);
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     struct Slot {
@@ -497,7 +500,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
             slot_count(ram, disk);
-            if (ram <= slot_max) break;
+            uint64_t ram_bytes = 0;
+            for (const Slot& s : slots)
+                if (s.data) ram_bytes += s.data->size();
+            if (ram <= slot_max && (slot_ram_budget == 0 || ram_bytes <= slot_ram_budget)) break;   // (10-26 local)
             size_t lru = SIZE_MAX;
             for (size_t i = 0; i < slots.size(); ++i)
                 if (slots[i].data && (lru == SIZE_MAX || slots[i].used < slots[lru].used)) lru = i;

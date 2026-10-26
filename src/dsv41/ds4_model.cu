@@ -7632,7 +7632,10 @@ struct Model::Impl {
             c.io_d0 = c.io->direct_bytes();
             c.io_b0 = c.io->buffered_bytes();
             if (!c.fl_layers.empty()) {
-                flow_spec(c, 0, c.fl_layers[0], run.T[0]);
+                // (10-26 port of Maya #343) a group starting at or after the skip layer has only KV work before the
+                // cut: its stream starts at the cut's chunk and rows
+                const int il0 = c.fl_layers[0], k0 = run.yoco >= 0 && il0 >= run.yoco ? run.cut_k : 0;
+                flow_spec(c, k0, il0, fl_rows(c, k0, il0));
                 if (!flow_pump(c, err)) return false;
             }
             if (c.lm) return run_dev_layers(di, run, err);
@@ -8176,10 +8179,19 @@ struct Model::Impl {
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
+        // (10-26 port of Maya #343) every layer on one device, and the skip layer and every one after it on one
+        // GPU: all of them (as before), or a layer split's last group (the earlier groups hand off every row - the
+        // skip layer's kv_only needs them - and no Engram layer from the skip layer on)
+        bool one = true;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || l.dev != L[0].dev) return -1;
+            if (l.nm != 1 || (il >= yl && l.dev != L[(size_t) yl].dev)) return -1;
+            if (l.dev != L[0].dev) one = false;
+        }
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
+            if (!one && il >= yl && l.eg >= 0) return -1;
         }
         return yl;
     }
@@ -8226,6 +8238,8 @@ struct Model::Impl {
             run.yoco = yl;
             run.cut_k = a / per;
             run.cut_r = a - run.cut_k * per;
+            std::fprintf(stderr, "ds4: prompt skip: layers %d-%d from CUDA%d, %d early rows KV-only, %d kept\n",
+                         yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id, a, n - a);   // (10-26 port of Maya #343)
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);

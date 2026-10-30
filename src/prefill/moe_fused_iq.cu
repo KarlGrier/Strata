@@ -1230,16 +1230,18 @@ native_ws_kernel(const WideBatch b, const NativeGeom geo, const Tables tb, const
 // formats, which is Basalt's pre-v2 kernel for them line for line on sm_80+):
 //   - the int32 dot of a 32-value sub-block: the same (mma.sync m16n8k32 from C = MAGIC, exact);
 //   - d_w: the same value (IQ3_XXS: d / 4 * (2s + 1) here, d * (2s + 1) / 4 there - both exact; IQ4_NL: d);
-//   - the term of a sub-block: native_kernel acc = fma(round(d_w * d_x), dot, acc), v2 acc = fma(round(dot * d_w),
-//     d_x, acc): both two FP32 roundings, of different products - the one place the results differ (~1 ulp a term);
+//   - the term of a sub-block: native_kernel acc = fma(round(d_w * d_x), dot, acc); Basalt's v2 has acc =
+//     fma(round(dot * d_w), d_x, acc), ~1 ulp a term apart - here v2 takes native_kernel's term (r22 gap 16: two
+//     rounding-level steps stacked failed the KL rule on the v0.2.7 port), so v2 and the current kernels give the
+//     same bits and v2 keeps only its memory-side gains;
 //   - the order along K: the same in both, the 32-value sub-blocks one after another (native_kernel two a 64-value
 //     stage, v2 four a 128-value chunk), one FP32 accumulator per output;
 //   - SwiGLU, H's max per 32 features (two warps' maxima through shared memory here, shuffles there: max is exact in
-//     any order), its int8 rounding (__float2int_rn(h * 127 / max)) and scale (max / 127): the same formulas - so an H
-//     code moves by one only where the ~1 ulp difference of h crosses a rounding boundary;
+//     any order), its int8 rounding (__float2int_rn(h * 127 / max)) and scale (max / 127): the same formulas - with
+//     the same term, the same h and so the same H codes;
 //   - the down outputs: the accumulators as they are, in both;
 //   - the activations, the grouping, H's layout and the rows each item covers: the same buffers and tables.
-// Not changed against Basalt: the kernel body (only cp4 is defined here; moe_fused.cu has its own).  Changed: the
+// Not changed against Basalt: the kernel body (only cp4 is defined here; moe_fused.cu has its own) but the term above.  Changed: the
 // switch (STRATA_PREFILL_V2, off by default, 2 / 3 for one half only), the counters' bytes (group_bytes adds them only
 // when v2 is asked for), the device check (STRATA_EMULATE_CC, a Turing opt-in device and the shared memory per block
 // count; one line naming why a device keeps the kernels above), and no HIP build.
@@ -1464,9 +1466,9 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
             const int so = (c & 1) * V2_ACT;
 #pragma unroll
             for (int j = 0; j < 4; ++j) {                       // the chunk's 32-value sub-blocks
-                // A fragments: {row g lo, row g + 8 lo, row g hi, row g + 8 hi}; per row d_w and -1.5 * 2^23 * d_w
+                // A fragments: {row g lo, row g + 8 lo, row g hi, row g + 8 hi}; per row d_w
                 uint32_t a[2][4];
-                float dw[2][2], nm[2][2];
+                float dw[2][2];
 #pragma unroll
                 for (int i = 0; i < 2; ++i)
 #pragma unroll
@@ -1478,7 +1480,6 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
                         a[i][hh] = lo;
                         a[i][2 + hh] = hi;
                         dw[i][hh] = d;
-                        nm[i][hh] = -MAGICF * d;
                     }
                 const float* sdx = (const float*) (smem + so + V2_NR * V2_CSTR) + j * V2_NR;
 #pragma unroll
@@ -1494,11 +1495,12 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
                             int d[4];
                             mma32(d, a[i], bq[2 * nn], bq[2 * nn + 1]);
                             float* ac = acc[i][2 * np + nn];
-                            // D = 1.5 * 2^23 + dot (rows g, g + 8 x columns 2t, 2t + 1)
-                            ac[0] = __fmaf_rn(__fmaf_rn(__int_as_float(d[0]), dw[i][0], nm[i][0]), dx.x, ac[0]);
-                            ac[1] = __fmaf_rn(__fmaf_rn(__int_as_float(d[1]), dw[i][0], nm[i][0]), dx.y, ac[1]);
-                            ac[2] = __fmaf_rn(__fmaf_rn(__int_as_float(d[2]), dw[i][1], nm[i][1]), dx.x, ac[2]);
-                            ac[3] = __fmaf_rn(__fmaf_rn(__int_as_float(d[3]), dw[i][1], nm[i][1]), dx.y, ac[3]);
+                            // D = 1.5 * 2^23 + dot (rows g, g + 8 x columns 2t, 2t + 1).  native_kernel's term bit for
+                            // bit (r22 gap 16): acc = fma(round(d_w * d_x), dot, acc), dot = D - 1.5 * 2^23 (exact)
+                            ac[0] = __fmaf_rn(__fmul_rn(dw[i][0], dx.x), __fsub_rn(__int_as_float(d[0]), MAGICF), ac[0]);
+                            ac[1] = __fmaf_rn(__fmul_rn(dw[i][0], dx.y), __fsub_rn(__int_as_float(d[1]), MAGICF), ac[1]);
+                            ac[2] = __fmaf_rn(__fmul_rn(dw[i][1], dx.x), __fsub_rn(__int_as_float(d[2]), MAGICF), ac[2]);
+                            ac[3] = __fmaf_rn(__fmul_rn(dw[i][1], dx.y), __fsub_rn(__int_as_float(d[3]), MAGICF), ac[3]);
                         }
                     }
                 }

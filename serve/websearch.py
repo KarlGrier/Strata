@@ -380,19 +380,19 @@ class WebHub:
 
     # the tools -------------------------------------------------------------------------------------------------
     @staticmethod
-    def _tavily(query: str, n: int, why: str) -> list[dict]:
-        """2026-10-19 (local): the deep-research workspace's Tavily fallback (dormant until its key file exists; monthly
-        cap; never logs the key), as SearXNG-shaped results."""
+    def _fallback(query: str, n: int, why: str) -> list[dict]:
+        """2026-10-19 (local): the deep-research workspace's search fallback - Exa, then Tavily, each dormant until its
+        key file exists, with its own monthly cap, never logging the key - as SearXNG-shaped results."""
         try:
             import sys as _sys
             if "/home/USER/ai/deep-research/tools" not in _sys.path:
                 _sys.path.insert(0, "/home/USER/ai/deep-research/tools")
-            import tavily_fallback as tf
-            got = tf.search(query, max_results=n, client="chat", reason=why) or []
+            import search_fallback as sf
+            got = sf.search(query, max_results=n, client="chat", reason=why) or []
         except Exception:  # noqa: BLE001 - no fallback, SearXNG's answer stands
             return []
         return [{"title": x["title"], "url": x["url"], "content": x["content"],
-                 "publishedDate": x.get("published_date"), "via_tavily": True} for x in got]
+                 "publishedDate": x.get("published_date"), "via": x.get("engine")} for x in got]
 
     def search(self, query: str, max_results, cancel) -> str:
         if not query:
@@ -421,15 +421,15 @@ class WebHub:
             th.join(0.1)
             _check_cancel(cancel, deadline)
         if "error" in box:
-            extra = self._tavily(query, n, "searxng error")
+            extra = self._fallback(query, n, "searxng error")
             if not extra:
                 raise WebError(f"the search service at {base} did not answer ({box['error']}); is SearXNG running?")
             box["data"] = {"results": extra}
         data = box.get("data") or {}
         results = [r for r in data.get("results") or [] if isinstance(r, dict) and r.get("url")]
-        if len(results) < 3 and not any(r.get("via_tavily") for r in results):
+        if len(results) < 3 and not any(r.get("via") for r in results):
             seen = {r["url"] for r in results}
-            results += [x for x in self._tavily(query, n, f"searxng returned {len(results)}") if x["url"] not in seen]
+            results += [x for x in self._fallback(query, n, f"searxng returned {len(results)}") if x["url"] not in seen]
         lines = [f"Search results for: {query}"]
         for a in (data.get("answers") or [])[:2]:
             a = a.get("answer") if isinstance(a, dict) else a
@@ -442,10 +442,12 @@ class WebHub:
             date = str(r.get("publishedDate") or "")[:10]
             lines.append(f"\n{i}. {title}\n   {r['url']}" + (f"\n   {snippet}" if snippet else "") +
                          (f"\n   (published {date})" if date and date != "None" else ""))
-        k = sum(1 for r in results[:n] if r.get("via_tavily"))
-        if k:
-            lines.append(f"\n({k} of these results came from a fallback search service, Tavily, because the local search "
-                         "returned too few.)")
+        via = [r["via"] for r in results[:n] if r.get("via")]
+        if via:
+            label = {"exa": "Exa", "tavily": "Tavily"}
+            names = " and ".join(sorted({label.get(v, v) for v in via}))
+            lines.append(f"\n({len(via)} of these results came from a fallback search service, {names}, because the local "
+                         "search returned too few.)")
         if not results:
             dead = ", ".join(str(e[0]) for e in (data.get("unresponsive_engines") or [])[:5] if e)
             lines.append("No results." + (f" (engines not answering: {dead})" if dead else ""))

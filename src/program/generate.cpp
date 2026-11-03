@@ -18587,7 +18587,8 @@ int main(int argc, char** argv) {
                         // candidates (not DFlash2's: req_df2; not STRATA_SPEC_COST's window)
                         if (use_mtp && !req_df2 && req_spec_min_p > 0.0 &&
                             !strata::spec::cost_window_applies(use_mtp, spec_cost, req_df2, first_window)) {
-                            if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                            if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                                T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) req_spec_min_p);
                         }
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
@@ -20591,7 +20592,8 @@ int main(int argc, char** argv) {
                 // candidates (not DFlash2's: spec_uses_df2; not STRATA_SPEC_COST's window)
                 if (use_mtp && !spec_uses_df2 && o.spec_min_p > 0.0 &&
                     !strata::spec::cost_window_applies(use_mtp, spec_cost, spec_uses_df2, first_window)) {
-                    if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                    if (strata::spec::cost_gate().on)   // round 12 (past its table: --spec-min-p)
+                        T = strata::spec::cost_gate_T(dprob.data(), S_mtp, (float) o.spec_min_p);
                 }
             }
             if (first_window) T = 1;

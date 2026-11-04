@@ -425,9 +425,49 @@ inline int ring_slots(size_t T) {
     const int big = r < 16 ? 16 : r > ring_cap() ? ring_cap() : r;
     return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
+// r23 STRATA_PF_AHEAD (local, off by default; adapted from Basalt (MIT, Copyright (c) 2026 Jesus Gulfo,
+// https://github.com/jesdga95/basalt), src/prefill/prefill.cpp at 31aacda2 "a short prompt chunk copies the next layer's
+// likely experts during its attention"): in a chunk below stream_all_min() a layer's experts are copied only once its
+// routing is known, so the link idles from the end of one layer's experts to the next layer's routing.  With the switch
+// each MoE half of such a chunk also runs the NEXT layer's router on its own FFN rows; the experts that guess gives more
+// than MAXT rows (more than the CPU share takes; not resident, page-locked) are copied, most rows first, into staging
+// slots past the staged walk's STAGE_GRP, one set per layer parity, once the layer has queued every input of its combine
+// (the CPU's rows cross the same link).  The next layer reads the ones its routing picked in place.  What is computed,
+// from which bytes and in which order does not change: only the slot a blob is read from and when its copy is issued.
+//   unset / 0: off - today's walk, slot for slot
+//   1: copies ahead only into staging slots the layout already holds (a staged tail of a long prompt, read in the long
+//      prompt's own stream-all layout: its ring's slots past STAGE_GRP).  The loan does not change, so neither do the
+//      bits: a candidate for the exact gate
+//   2: also Basalt's slot rule for a staged layout (a prompt shorter than stream_all_min(): STAGE_GRP + 2 x min(64,
+//      T / 32) staging slots instead of STAGE_GRP).  The loan grows, so other experts are non-resident during such a
+//      prompt and the CPU share may take other ones: rounding-level through the share (bitwise with the share off)
+// STRATA_PF_AHEAD_MAX=N: at most N slots per layer parity (default 112, what Basalt's 256-slot ring leaves a tail).
+inline int pf_ahead_mode() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_AHEAD");
+        const int x = e ? std::atoi(e) : 0;
+        return x == 1 || x == 2 ? x : 0;
+    }();
+    return v;
+}
+inline int pf_ahead_max() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_PF_AHEAD_MAX");
+        const int x = e ? std::atoi(e) : 112;
+        return std::clamp(x, 1, (RING_MAX - STAGE_GRP) / 2);
+    }();
+    return v;
+}
+constexpr int kAheadSlotsSmall = 64;   // Basalt's kAheadSlots: a staged layout's slots per parity (one per 32 tokens)
 // The staging buffers a layout holds: the ring, and at least STAGE_GRP for the staged walk's grouped gather.  Counted
 // and taken through this one place, so the bytes the prompt path borrows cover every buffer it writes.
-inline int stage_slots(size_t T) { return std::max(ring_slots(T), STAGE_GRP); }
+// (STRATA_PF_AHEAD=2: a staged layout also holds its copies-ahead slots; never past ring_cap(), whose events exist)
+inline int stage_slots(size_t T) {
+    const int base = std::max(ring_slots(T), STAGE_GRP);
+    if (pf_ahead_mode() == 2 && (int64_t) T < stream_all_min())
+        return std::max(base, std::min(ring_cap(), STAGE_GRP + 2 * (int) std::min<size_t>(kAheadSlotsSmall, T / 32)));
+    return base;
+}
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -1181,6 +1221,19 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    // r23 STRATA_PF_AHEAD (pf_ahead_mode; Basalt 31aacda2): a staged chunk's guess of the next layer's routing (the next
+    // layer's router on this layer's FFN rows; on the device and in mapped host memory, outside the loan), the rows it
+    // gives each expert, and per layer parity the layer whose experts were copied ahead and each one's staging slot
+    // (-1: not copied ahead); and this run's counts for its one log line
+    int32_t *guess_ids = nullptr, *guess_host = nullptr, *guess_host_dev = nullptr;
+    float* guess_w = nullptr;
+    int64_t guess_cap = 0, guess_layer = -1;
+    bool guess_failed = false;               // the buffers could not be had: no copies ahead for this engine
+    std::vector<int32_t> guess_rows;
+    std::vector<int32_t> ahead_slot[2];
+    int64_t ahead_layer[2] = {-1, -1};
+    cudaEvent_t ahead_ev = nullptr;          // where on the compute stream the copies ahead may start
+    int64_t ahead_copied = 0, ahead_used = 0;
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1371,6 +1424,11 @@ void Prefill::release() {
         if (e) cudaEventDestroy(e);
     for (cudaEvent_t e : impl_->cpu_wall)
         if (e) cudaEventDestroy(e);
+    // STRATA_PF_AHEAD: the guess buffers (outside `owned`: they are re-allocated when a larger staged chunk needs them)
+    if (impl_->ahead_ev) cudaEventDestroy(impl_->ahead_ev);
+    if (impl_->guess_ids) cudaFree(impl_->guess_ids);
+    if (impl_->guess_w) cudaFree(impl_->guess_w);
+    if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
@@ -1736,6 +1794,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
 #endif
     m.wt = &wt; m.g = &g; m.ss = &ss; m.src = src; m.cache = cache; m.host_res = host_res;
     m.T = chunk; m.cs = (cudaStream_t) stream; m.stats = &stats_;
+    if (static bool said = false; pf_ahead_mode() != 0 && !said) {   // r23: once per process, what the switch does
+        said = true;
+        std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD=%d: a chunk below the stream-all size copies the next layer's "
+                             "likely experts ahead of its routing (at most %d slots per layer parity%s; adapted from Basalt)\n",
+                     pf_ahead_mode(), pf_ahead_max(),
+                     pf_ahead_mode() == 2 ? ", and a short prompt's layout holds them" : ", in slots its layout already holds");
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -3216,6 +3281,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    m.ahead_copied = m.ahead_used = 0;   // STRATA_PF_AHEAD: this run's counts
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
     const KvaConfig& kva = kva_config();
@@ -3925,6 +3991,90 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             p_issue_until((size_t) m.pp->RP);
             cudaSetDevice(pd);
         }
+        // r23 STRATA_PF_AHEAD (pf_ahead_mode; adapted from Basalt 31aacda2): a chunk below stream_all_min() guesses each
+        // next layer's routing in its MoE half and copies the likely experts ahead, into the layout's own staging slots
+        // past STAGE_GRP (the staged walk takes at most STAGE_GRP), `ahead_n` per layer parity.  Not on a multi-GPU
+        // prompt path (m.pp), a KVA run, or a chunk with no expert source or cache.
+        const int ahead_room = std::min<int>(m.ring_room_at, ring_cap());   // this layout's own staging slots
+        int ahead_n = 0;
+        if (pf_ahead_mode() != 0 && !stream_all && m.src != nullptr && m.cache != nullptr && m.host_res != nullptr &&
+            !m.pp && !kva_run && LE - LB > 1 && ahead_room > STAGE_GRP && !m.guess_failed) {
+            ahead_n = std::min(pf_ahead_max(), (ahead_room - STAGE_GRP) / 2);
+            if (ahead_n > 0 && m.guess_cap < T * K) {   // the guess buffers, outside the loan, at the largest staged chunk
+                const int64_t rows = std::max<int64_t>(T, stream_all_min() - 1) * K;
+                if (m.guess_ids) (void) cudaFree(m.guess_ids);
+                if (m.guess_w) (void) cudaFree(m.guess_w);
+                if (m.guess_host) (void) cudaFreeHost(m.guess_host);
+                m.guess_ids = m.guess_host = m.guess_host_dev = nullptr;
+                m.guess_w = nullptr;
+                m.guess_cap = 0;
+                void* hd = nullptr;
+                bool got = cudaMalloc((void**) &m.guess_ids, (size_t) rows * 4) == cudaSuccess;
+                got = got && cudaMalloc((void**) &m.guess_w, (size_t) rows * 4) == cudaSuccess;
+                got = got && cudaHostAlloc((void**) &m.guess_host, (size_t) rows * 4,
+                                           cudaHostAllocMapped | (core::peer_portable() ? cudaHostAllocPortable : 0)) == cudaSuccess &&
+                      cudaHostGetDevicePointer(&hd, m.guess_host, 0) == cudaSuccess;
+                if (got) {
+                    m.guess_host_dev = (int32_t*) hd;
+                    m.guess_cap = rows;
+                } else {
+                    (void) cudaGetLastError();
+                    m.guess_failed = true;   // (what was had is freed in release)
+                    std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD: the routing guess's buffers (%lld rows) could not be "
+                                         "had; no copies ahead for this engine\n", (long long) rows);
+                }
+            }
+            if (m.guess_cap < T * K) ahead_n = 0;
+        }
+        // a slot copied ahead (the group gather waits on it in the walk and releases it with its group)
+        auto is_ahead = [&](int slot) { return ahead_n > 0 && slot >= STAGE_GRP && slot < STAGE_GRP + 2 * ahead_n; };
+        int64_t guess_for = -1;   // the layer whose routing this layer's MoE half guessed
+        m.ahead_layer[0] = m.ahead_layer[1] = m.guess_layer = -1;   // nothing of an earlier chunk is read in place
+        auto copy_ahead = [&](int64_t L) {
+            if (ahead_n <= 0 || L >= LE || m.guess_layer != L) return;
+            m.guess_layer = -1;
+            // a layer whose K/V streams from the host uploads it on the compute stream: no copies ahead of it
+            if (core::is_qsa_layer(g, L)) {
+                int64_t qi = 0;
+                for (int64_t i = 0; i < L; ++i) qi += core::is_qsa_layer(g, i) ? 1 : 0;
+                if (ss.qsa_states[(size_t) qi].kv_mode == 1) return;
+            }
+            if (m.ahead_ev == nullptr && cudaEventCreateWithFlags(&m.ahead_ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                m.ahead_ev = nullptr;
+                return;
+            }
+            std::vector<std::pair<int32_t, int32_t>> want;   // (-rows, expert): most rows first, then the lower id
+            for (int32_t e = 0; e < (int32_t) m.g->n_expert; ++e) {
+                const int32_t c = m.guess_rows[(size_t) e];
+                if (c <= strata::kernels::cpu::MAXT || m.host_res[(size_t) L * m.g->n_expert + e] >= 0) continue;
+                if (!m.src->pinned(L, e)) continue;   // an unpinned blob goes through the stager, after the routing
+                want.emplace_back(-c, e);
+            }
+            std::sort(want.begin(), want.end());
+            const int b = (int) (L & 1);
+            std::vector<int32_t>& slot_of = m.ahead_slot[b];
+            slot_of.assign((size_t) m.g->n_expert, -1);
+            m.ahead_layer[b] = L;
+            // queued after what the compute stream has so far (this layer's CPU rows' upload crosses the same link)
+            cudaEventRecord(m.ahead_ev, m.cs);
+            cudaStreamWaitEvent(m.copy, m.ahead_ev, 0);
+            int k = 0;
+            for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
+                const int32_t e = want[i].second;
+                const uint8_t* bl = m.src->blob_stable(L, e);
+                if (bl == nullptr) continue;
+                const int sl = STAGE_GRP + b * ahead_n + k++;
+                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                cudaMemcpyAsync(m.stage_dev[sl], bl, (size_t) lay0.blob_bytes(L), cudaMemcpyHostToDevice, m.copy);
+                cudaEventRecord(m.copied[sl], m.copy);
+                m.stage_live[sl] = true;
+                slot_of[(size_t) e] = sl;
+                ++stats_.experts_streamed;
+                ++stats_.experts_dma;
+                ++m.ahead_copied;
+            }
+        };
         host_setup_ms += ms_since(tsetup);
         bool normed = false;   // F-2: the previous half's write already normed R for this half (grs, xn16)
         // #579 #613 (opt-in diagnosis, STRATA_PF_STEP_SYNC=1): the compute and copy streams are waited for after each
@@ -3961,6 +4111,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 pt.mark(kPfPle, cs);
                 if (!ple_land()) return false;
             }
+            if (l == 1 && LB == 0 && ple_on) copy_ahead(1);   // STRATA_PF_AHEAD: after layer 1's PLE rows' upload (see layer 0's combine)
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
                 // the whole chunk at once, in sub-batches carved from the idle scratch region: the key and value
@@ -4527,6 +4678,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
+                    // STRATA_PF_AHEAD: the next layer's routing guessed from this layer's FFN rows (its router on them; the
+                    // logits are free again once `route` has read them).  Its own ids, weights and mapped host copy: nothing
+                    // this layer computes reads them; the grouping's sync below makes them readable on the host.
+                    if (ahead_n > 0 && l + 1 < LE) {
+                        const core::LayerView vn(*m.wt, l + 1);
+                        const core::WeightRef* wrn = vn.get("ffn_gate_inp.weight");
+                        std::string e2;
+                        if (wrn != nullptr && bf16_proj(m.gemm, wrn, m.mixed_bf, m.logits, T, vn.name("ffn_gate_inp.weight"), e2)) {
+                            route(m.logits, m.guess_ids, m.guess_w, T, m.g->n_expert, m.cs);
+                            copy_i32(m.guess_host_dev, m.guess_ids, T * K, m.cs);
+                            guess_for = l + 1;
+                        }
+                    }
                     // the shared expert and its scalar gate
                     auto shared_expert = [&]() -> bool {
                         if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
@@ -4753,6 +4917,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                           l, p0);
                         cudaStreamSynchronize(m.cs);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
+                        if (guess_for == l + 1) {   // STRATA_PF_AHEAD: the rows the guess gives each expert of the next layer
+                            m.guess_rows.assign((size_t) m.g->n_expert, 0);
+                            for (int64_t i = 0; i < T * K; ++i) {
+                                const int32_t e = m.guess_host[(size_t) i];
+                                if (e >= 0 && e < (int32_t) m.g->n_expert) ++m.guess_rows[(size_t) e];
+                            }
+                            m.guess_layer = l + 1;
+                        }
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
                             const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
@@ -5523,6 +5695,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
+                            if (ahead_n > 0 && m.ahead_layer[l & 1] == l && m.ahead_slot[l & 1][(size_t) e] >= 0) {
+                                stage_of[j] = m.ahead_slot[l & 1][(size_t) e];   // STRATA_PF_AHEAD: copied ahead of the routing
+                                ++m.ahead_used;
+                                return true;
+                            }
                             const int sl = stage_next;
                             stage_next = (stage_next + 1) % stage_n;
                             const auto th = Clock::now();
@@ -5559,7 +5736,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int gg_slots[MMQ_GROUP];
                         size_t gg_ents[MMQ_GROUP];   // the streamed walk: their entries (wait_copied)
                         int gg_nslots = 0;   // ring slots gathered by the next flush
+                        // STRATA_PF_AHEAD: the open group's slots copied ahead.  Their copies were queued before this
+                        // layer's staged ones, so the group's one wait (on its last staged copy) does not stand for them:
+                        // the walk waits on each one, and the flush releases them with the group.
+                        int gg_ahead[MMQ_GROUP];
+                        int gg_nahead = 0;
                         size_t cur_entry = 0;   // the streamed walk: the entry compute() is given
+                        auto gg_take = [&](int slot) {   // a gathered expert's slot, for the group's wait and release
+                            if (slot < 0) return;
+                            if (is_ahead(slot)) { gg_ahead[gg_nahead++] = slot; return; }
+                            gg_ents[gg_nslots] = cur_entry;
+                            gg_slots[gg_nslots++] = slot;
+                        };
                         // STRATA_MMQ_DIRECT=1: a resident expert with guard room in its slot is not gathered - the
                         // group's pointer tables give MMQ each expert's own address (group position q), the others are
                         // gathered at compact positions c = 0..ns-1 of the group buffers, as before (same bytes)
@@ -5602,6 +5790,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                             }
                             gg_nslots = 0;
+                            if (gg_nahead > 0) {   // STRATA_PF_AHEAD: the copied-ahead slots this gather read
+                                const int rel = gg_ahead[gg_nahead - 1];
+                                cudaEventRecord(m.used[rel], m.cs);
+                                for (int i = 0; i < gg_nahead; ++i) m.used_of[gg_ahead[i]] = rel;
+                            }
+                            gg_nahead = 0;
                             gg.first = gg.n;
                         };
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
@@ -5643,7 +5837,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         if (gg_now) {
                                             gg.blob[c] = blob_dev;
                                             gg.n = c + 1;
-                                            if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
+                                            gg_take(slot);   // (STRATA_PF_AHEAD: a copied-ahead slot is kept apart)
                                         } else {
                                             mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                                mmq_db, m.grp_gu + (size_t) c * mmq_gub,
@@ -5660,7 +5854,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (gg_now) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
-                                    if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
+                                    gg_take(slot);   // (STRATA_PF_AHEAD: a copied-ahead slot is kept apart)
                                     if (!last_of_group) return true;
                                     flush(MMQ_TAIL);
                                     gg = mmq::GatherGroup{};
@@ -5864,9 +6058,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1,
                                                  m.host_res[(size_t) l * m.g->n_expert + e])) return false;
                                 } else {
-                                    if (!group_resident) {   // grouped: the flush waits once, on the group's last copy
-                                        pt.mark(kPfWaitCopy, cs);
-                                        cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                    if (!group_resident || is_ahead(stage_of[j])) {   // grouped: the flush waits once, on the
+                                        pt.mark(kPfWaitCopy, cs);                     // group's last staged copy (STRATA_PF_AHEAD:
+                                        cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);   // a slot copied ahead, here)
                                     }
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
                                     --pending;   // compute recorded the slot's release event before any reuse
@@ -5946,6 +6140,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
+                    // STRATA_PF_AHEAD: the next layer's likely experts, now that every input of this combine is queued (at
+                    // layer 0 with the PLE block on, after layer 1's PLE rows instead: they go up first)
+                    if (!(l == 0 && ple_on)) copy_ahead(l + 1);
                     if (peer_now && m.pp->sums && m.pp->f16)
                         moe_combine_peer16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.pp->host_sum16, m.pp->back_at, m.bo, T, m.cs);
                     else if (peer_now && m.pp->sums)
@@ -6212,6 +6409,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
+    if (pf_ahead_mode() != 0 && m.ahead_copied > 0)   // STRATA_PF_AHEAD: one line per prompt that copied ahead
+        std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD=%d: %lld experts copied ahead of their layer's routing, %lld read "
+                             "in place (%.0f%%)\n", pf_ahead_mode(), (long long) m.ahead_copied, (long long) m.ahead_used,
+                     100.0 * (double) m.ahead_used / (double) m.ahead_copied);
     stats_.ms_total += ms_since(t_start);
     {
         static const bool f16_range = std::getenv("STRATA_F16_RANGE") != nullptr;

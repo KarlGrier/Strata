@@ -468,6 +468,28 @@ inline int stage_slots(size_t T) {
         return std::max(base, std::min(ring_cap(), STAGE_GRP + 2 * (int) std::min<size_t>(kAheadSlotsSmall, T / 32)));
     return base;
 }
+// r23 STRATA_PF_TAIL_SPLIT (local, off by default, rounding-level; after Basalt's equal prompt chunks - MIT, Copyright (c)
+// 2026 Jesus Gulfo, https://github.com/jesdga95/basalt: 2c3a6209 / 1814f315 "fewest equal chunks", e8f3b84b the
+// 16384-token first chunk): a prompt longer than the chunk reads in chunks of the chunk size and a last one of the rest.
+// A rest below stream_all_min() is a staged chunk: each layer's experts are copied after its routing, and from ~200
+// tokens on it routes to nearly every expert (1 - (1 - 10/512)^T is 97 % at 180 tokens), so it costs about one more
+// pass over the experts with little compute to hide it behind.  With the switch such a rest, if it has at least the
+// switch's tokens, and the chunk before it are read as two near-equal chunks (the first rounded up to 256 tokens, both
+// at least stream_all_min() long), each streaming every expert behind its own compute.  The chunks before them keep the
+// chunk size, so the chat cache's checkpoints on that grid stay; the one at the last grid point before the end moves to
+// the end.  The chunk boundaries move, and with them the GEMM tiles that round the K/V: rounding-level (the KL gate).
+// A shorter rest is left alone: it routes to few experts and costs little (upstream's note at pipeline_chunk).
+// 1: rests of 256 tokens or more; N > 1: of N or more.  Only a run that plans its own chunks (no forced chunk, no
+// pipe plan, one stage, no KVA).
+inline int64_t pf_tail_split_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_TAIL_SPLIT");
+        if (e == nullptr || e[0] == '\0' || e[0] == '0') return (int64_t) 0;
+        const int64_t x = std::atoll(e);
+        return x == 1 ? (int64_t) 256 : std::max<int64_t>(x, 1);
+    }();
+    return v;
+}
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -3358,6 +3380,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // pool would decide which experts the CPU computed (other bits) - timing, where the chunks are a function of n
     const bool pipe_chunked = hand_in_ == nullptr ? (forced > 0 ? forced_planned : planned_C > 0 && C < std::min(n, m.T))
                                                   : pipe_chunked_;
+    // r23 STRATA_PF_TAIL_SPLIT (pf_tail_split_min): the last chunk and a staged rest of at least the switch's tokens as
+    // two near-equal stream-all chunks starting at `tail_at` (`tail_a` tokens, then the rest); every other chunk as before.
+    // chunk_len(at) is the one place the chunk at `at` gets its length (the loop, the PLE gather, the next gather's start).
+    int64_t tail_at = -1, tail_a = 0;
+    if (const int64_t tmin = pf_tail_split_min(); tmin > 0 && forced == 0 && planned_C == 0 && hand_in_ == nullptr &&
+                                                  next_ == nullptr && !kva_run && m.src != nullptr && m.ring > STAGE &&
+                                                  C > 0 && n > C) {
+        const int64_t k = (n + C - 1) / C, last = n - (k - 1) * C, smin = stream_all_min();
+        const int64_t r = C + last, a = std::min<int64_t>(C, ((r + 1) / 2 + 255) / 256 * 256);
+        if (last >= tmin && last < smin && a >= smin && r - a >= smin) {
+            tail_at = (k - 2) * C;
+            tail_a = a;
+            std::fprintf(stderr, "strata prefill: STRATA_PF_TAIL_SPLIT: %lld tokens from %lld: the last %lld (a %lld-token chunk and "
+                                 "a %lld-token rest) read as chunks of %lld and %lld tokens\n", (long long) n, (long long) pos0,
+                         (long long) r, (long long) C, (long long) last, (long long) a, (long long) (r - a));
+        }
+    }
+    const auto chunk_len = [n, C, tail_at, tail_a](int64_t at) -> int64_t {
+        if (tail_at >= 0 && at >= tail_at) return at == tail_at ? tail_a : n - at;
+        return std::min(C, n - at);
+    };
     const bool helped = single_chunk && bind_stage_helper(n);
     if (helped) std::swap(m.pp, m.help_pp);
     struct HelpScope {
@@ -3390,8 +3433,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                            (ss.ple.w.key_bf16 != nullptr || ss.ple.w.key_native_data != nullptr) &&
                            m.region_bytes / ((uint64_t) (3 * strata::kernels::NG_HC_DIM + N + 4) * 4 + (uint64_t) N * 2 + 4096) >= 64;
     const int32_t prev0[2] = {prev[0], prev[1]};
-    auto ple_gather = [&m, &ss, tokens, n, prev0, C](int64_t c0, int buf, std::string& e) -> bool {
-        const int64_t T = std::min(C, n - c0);
+    auto ple_gather = [&m, &ss, tokens, prev0, chunk_len](int64_t c0, int buf, std::string& e) -> bool {
+        const int64_t T = chunk_len(c0);   // (STRATA_PF_TAIL_SPLIT: the chunk at c0, whatever its length)
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -3434,7 +3477,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         for (size_t i = 0; i < tap_local_.size(); ++i) tap_slot[(size_t) tap_local_[i]] = (int) i;
     }
 #endif
-    for (int64_t c0 = 0; c0 < n; c0 += C) {
+    for (int64_t c0 = 0; c0 < n; c0 += chunk_len(c0)) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
         // waits for the later stages to read them)
@@ -3451,7 +3494,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
             std::fflush(stderr);
         }
-        const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+        const int64_t T = chunk_len(c0), p0 = pos0 + c0;
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
@@ -3610,13 +3653,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     return false;
                 }
             }
-            if (c0 + C < n) {
+            if (c0 + T < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
                 if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
-                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + C, b = ple_buf ^ 1] {
+                ple_next = std::async(std::launch::async, [&ple_gather, &ple_next_err, c1 = c0 + T, b = ple_buf ^ 1] {
                     strata::aux_cpus::pin_current_thread();
                     return ple_gather(c1, b, ple_next_err);
                 });
@@ -6384,7 +6427,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (float v : h) { c += !std::isfinite(v); if (std::isfinite(v)) mx = std::max(mx, (double) std::fabs(v)); }
             std::fprintf(stderr, " %lld non-finite (max |x| %.3g)", (long long) c, mx);
         };
-        const int64_t last = (n - 1) % C;
+        int64_t c_last = 0;   // the last chunk's start (STRATA_PF_TAIL_SPLIT: chunks are not all C long)
+        for (int64_t a = 0; a < n; a += chunk_len(a)) c_last = a;
+        const int64_t last = n - 1 - c_last;
         std::fprintf(stderr, "strata dbg: prompt end: last residual row");
         bad(m.R + last * D, D);
         if (ss.ple.ready()) { std::fprintf(stderr, "; PLE history"); bad(ss.ple.hist, (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM); }

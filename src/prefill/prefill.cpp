@@ -490,6 +490,24 @@ inline int64_t pf_tail_split_min() {
     }();
     return v;
 }
+// r23 STRATA_PF_FIRST_CHUNK (local, off by default, rounding-level; after Basalt e8f3b84b "a long prompt starts with a
+// short first chunk" and its equal chunks, MIT, Copyright (c) 2026 Jesus Gulfo): for a chunk above 16384 (--prefill
+// auto:N with a larger N): a prompt longer than the chunk reads its first N0 tokens as one chunk and the rest in equal
+// chunks of at most the chunk (each rounded up to 256 tokens, the last the rest).  For us the point is the chat cache:
+// its periodic checkpoints are every 16384 tokens and land on chunk ends, so a 16384 first chunk keeps the first one
+// where it is and the equal chunks after it end just past the next grid points instead of skipping them (Basalt's own
+// point is the first chunk's wait for its PLE rows).  Rounding-level: the chunk boundaries move.  1: N0 = 16384; N > 1:
+// N0 = N rounded down to 256 (at least 1024).  Applies only where it leaves no staged chunk; it takes precedence over
+// STRATA_PF_TAIL_SPLIT (the equal rest has no short tail to split).
+inline int64_t pf_first_chunk() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_FIRST_CHUNK");
+        if (e == nullptr || e[0] == '\0' || e[0] == '0') return (int64_t) 0;
+        const int64_t x = std::atoll(e);
+        return x == 1 ? (int64_t) 16384 : std::max<int64_t>(1024, x / 256 * 256);
+    }();
+    return v;
+}
 constexpr int DQ = 2;              // dequantized-expert ring (FP16 gate/up + down)
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode. STRATA_PREFILL_BF16X2=1 adds each activation's BF16 remainder as a
@@ -3383,10 +3401,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // r23 STRATA_PF_TAIL_SPLIT (pf_tail_split_min): the last chunk and a staged rest of at least the switch's tokens as
     // two near-equal stream-all chunks starting at `tail_at` (`tail_a` tokens, then the rest); every other chunk as before.
     // chunk_len(at) is the one place the chunk at `at` gets its length (the loop, the PLE gather, the next gather's start).
+    // r23 STRATA_PF_FIRST_CHUNK (pf_first_chunk): a first chunk of `first_len`, then equal chunks of `eq_len` (the last the
+    // rest), for a chunk above the first one; it takes precedence over the tail split.
+    const bool own_plan = forced == 0 && planned_C == 0 && hand_in_ == nullptr && next_ == nullptr && !kva_run &&
+                          m.src != nullptr && m.ring > STAGE && C > 0 && n > C;   // a run that plans its own chunks
+    int64_t first_len = 0, eq_len = 0;
+    if (const int64_t f0 = pf_first_chunk(); f0 > 0 && own_plan && C > f0) {
+        const int64_t rest = n - f0, k = (rest + C - 1) / C, smin = stream_all_min();
+        const int64_t e = std::min<int64_t>(C, ((rest + k - 1) / k + 255) / 256 * 256);
+        if (k > 1 || rest >= smin) {
+            first_len = f0;
+            eq_len = e;
+            std::fprintf(stderr, "strata prefill: STRATA_PF_FIRST_CHUNK: %lld tokens from %lld: a first chunk of %lld, then %lld "
+                                 "chunk(s) of at most %lld (the chunk is %lld)\n", (long long) n, (long long) pos0, (long long) f0,
+                         (long long) k, (long long) e, (long long) C);
+        }
+    }
     int64_t tail_at = -1, tail_a = 0;
-    if (const int64_t tmin = pf_tail_split_min(); tmin > 0 && forced == 0 && planned_C == 0 && hand_in_ == nullptr &&
-                                                  next_ == nullptr && !kva_run && m.src != nullptr && m.ring > STAGE &&
-                                                  C > 0 && n > C) {
+    if (const int64_t tmin = pf_tail_split_min(); tmin > 0 && own_plan && first_len == 0) {
         const int64_t k = (n + C - 1) / C, last = n - (k - 1) * C, smin = stream_all_min();
         const int64_t r = C + last, a = std::min<int64_t>(C, ((r + 1) / 2 + 255) / 256 * 256);
         if (last >= tmin && last < smin && a >= smin && r - a >= smin) {
@@ -3397,7 +3429,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) r, (long long) C, (long long) last, (long long) a, (long long) (r - a));
         }
     }
-    const auto chunk_len = [n, C, tail_at, tail_a](int64_t at) -> int64_t {
+    const auto chunk_len = [n, C, tail_at, tail_a, first_len, eq_len](int64_t at) -> int64_t {
+        if (first_len > 0) return at == 0 ? first_len : std::min(eq_len, n - at);
         if (tail_at >= 0 && at >= tail_at) return at == tail_at ? tail_a : n - at;
         return std::min(C, n - at);
     };

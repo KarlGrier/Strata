@@ -18987,7 +18987,9 @@ int main(int argc, char** argv) {
                         // a probabilistic window must not condition the source on the draw: the policy copy fixed at the request's start
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && !req_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
-                        if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
+                        // exact speculative sampling: the draft head's raw argmax (before its draw), never the sampled draft - the choice
+                        // of q for position 1 must not depend on that position's own draw (an MTP round only: DFlash2's drafts are its own picks)
+                        if (k > 0 && (probabilistic || !draft_on || sbuf[0] == (use_mtp && !req_df2 && mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                             if (pk.lookup && !trace_nopick) { T = pk.t; from_sfx = true; }
@@ -19221,6 +19223,13 @@ int main(int argc, char** argv) {
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
+                // exact speculative sampling (STRATA_SPEC_EXACT=1, a sampled request): the drafter's rows verify with
+                // their q lists, a lookup window's drafts as point masses (core/spec_exact.hpp); no drafter: none;
+                // not on a merged first window either (STRATA_ADMIT_MERGE_FIRST: prompt tokens, no drafts), nor on a
+                // DFlash2 round (req_df2: its candidates are no draws from the MTP's q - the exact-match rule judges them)
+                ver.set_spec_window(use_mtp && !req_df2 && mtp.ess() && !first_window,
+                                    from_sfx || !use_mtp || req_df2 ? nullptr : mtp.ess_qlists(),
+                                    from_sfx || !use_mtp || req_df2 ? 0 : T - 1);
                 const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -20984,7 +20993,9 @@ int main(int argc, char** argv) {
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the
                 // lookup is taken without asking whether the MTP's first guess agrees
                 const bool probabilistic = use_mtp && !spec_uses_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
-                if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
+                // exact speculative sampling: the draft head's raw argmax (before its draw), never the sampled draft - the choice
+                // of q for position 1 must not depend on that position's own draw (an MTP round only: DFlash2's drafts are its own picks)
+                if (k > 0 && (probabilistic || !draft_on || sbuf[0] == (use_mtp && !spec_uses_df2 && mtp.ess() ? mtp.ess_top(0) : drafts[0]))) {
                     const strata::spec::DraftPolicy::Pick pk = probabilistic
                         ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                     if (pk.lookup) { T = pk.t; from_sfx = true; }
@@ -21043,6 +21054,8 @@ int main(int argc, char** argv) {
             // the MTP's q lists judge only candidates the MTP drew: DFlash2's are a deterministic pick (exact-match path)
             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
                 ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            ver.set_spec_window(use_mtp && !spec_uses_df2 && mtp.ess(), from_sfx || !use_mtp || spec_uses_df2 ? nullptr : mtp.ess_qlists(),
+                                from_sfx || !use_mtp || spec_uses_df2 ? 0 : T - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
             if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs

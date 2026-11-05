@@ -1120,6 +1120,224 @@ spec_verify_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_voca
     }
 }
 
+// ---- EXACT SPECULATIVE SAMPLING (include/strata/core/spec_exact.hpp, STRATA_SPEC_EXACT=1) -----------------------------
+// The four draws of a position: the request's own stream (a row without a draft - the bonus - is drawn exactly as
+// `sample_tokens` draws it, with the same uniform) and three streams of their own, tagged in the counter's top 16
+// bits (positions stay far below 2^48): the drafter's PROPOSAL, the ACCEPTANCE test, the RESIDUAL draw.
+constexpr uint64_t kEssProposal = 1, kEssAccept = 2, kEssResidual = 3;
+
+/// `philox_uniform`'s block, all four words (stream 0 and the same counter give `philox_uniform`'s draw in .x >> 8).
+__device__ __forceinline__ uint4 ess_philox(uint64_t seed, uint64_t counter, uint64_t stream) {
+    const uint64_t c = counter + (stream << 48);
+    uint32_t c0 = (uint32_t) c, c1 = (uint32_t) (c >> 32);
+    uint32_t c2 = (uint32_t) seed, c3 = (uint32_t) (seed >> 32);
+    for (int i = 0; i < 10; ++i) philox4x32_round(c0, c1, c2, c3, (uint32_t) i, 0u);
+    return make_uint4(c0, c1, c2, c3);
+}
+__device__ __forceinline__ uint64_t ess_u64(uint64_t seed, uint64_t counter, uint64_t stream) {
+    const uint4 b = ess_philox(seed, counter, stream);
+    return ((uint64_t) b.x << 32) | (uint64_t) b.y;
+}
+
+/// The final distribution of `sampled_tail_warp` - top_p, then min_p, then temperature over the top_k list - into
+/// ex[0 .. n_keep), returned in every lane.  THE SAME OPERATIONS IN THE SAME ORDER as `sampled_tail_warp` (its doubles,
+/// its ordered sums on lane 0), so ex is bit for bit the distribution that function draws from.
+__device__ int ess_final_dist(const float* sel_logit, int k, const SamplerParams& p, double* ex) {
+    const int lane = (int) (threadIdx.x & 31);
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    int n_keep = k;
+    float mx = sel_logit[0];
+    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+    if (p.top_p < 1.0f) {
+        for (int i = lane; i < k; i += 32) ex[i] = exp((double) sel_logit[i] - (double) mx);
+        __syncwarp();
+        double sum = 0.0;
+        if (lane == 0)
+            for (int i = 0; i < k; ++i) sum += ex[i];
+        sum = __shfl_sync(kFullMask, sum, 0);
+        __syncwarp();
+        for (int i = lane; i < k; i += 32) ex[i] = ex[i] / sum;
+        __syncwarp();
+        int cut = k;
+        if (lane == 0) {
+            double cum = 0.0;
+            for (int i = 0; i < k; ++i) {
+                cum += ex[i];
+                if (cum >= (double) p.top_p) { cut = i + 1; break; }
+            }
+        }
+        cut = __shfl_sync(kFullMask, cut, 0);
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+        __syncwarp();
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + logf(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    }
+    float smx = sel_logit[0] * inv_t;
+    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, sel_logit[i] * inv_t);
+    for (int i = lane; i < n_keep; i += 32) ex[i] = exp((double) (sel_logit[i] * inv_t) - (double) smx);
+    __syncwarp();
+    double sum = 0.0;
+    if (lane == 0)
+        for (int i = 0; i < n_keep; ++i) sum += ex[i];
+    sum = __shfl_sync(kFullMask, sum, 0);
+    __syncwarp();
+    for (int i = lane; i < n_keep; i += 32) ex[i] = ex[i] / sum;
+    __syncwarp();
+    return n_keep;
+}
+
+/// Lane 0: the EXACT distribution of the 24-bit inverse-CDF walk over ex[0 .. n) - `sampled_tail_warp` picks the first
+/// i with u < cum_i (u = m / 2^24, cum_i the running double sum) and the last entry when none: entry i owns the
+/// m in [C(cum_{i-1}), C(cum_i)) with C(c) = clamp(ceil(c * 2^24), 0, 2^24), the last entry everything above.  The
+/// counts sum to 2^24.  n == 0 (min_p > 1, which the callers clamp) is the walk's sel[0]: one entry, all of it.
+__device__ int ess_counts(const double* ex, int n, int32_t* cnt) {
+    if (n <= 0) { cnt[0] = kEssScale; return 1; }
+    double cum = 0.0;
+    int64_t prev = 0;
+    for (int i = 0; i < n; ++i) {
+        int64_t c = kEssScale;
+        if (i < n - 1) {
+            cum += ex[i];
+            const double x = ceil(cum * 16777216.0);
+            c = x <= 0.0 ? 0 : (x >= (double) kEssScale ? (int64_t) kEssScale : (int64_t) x);
+            if (c < prev) c = prev;
+        }
+        cnt[i] = (int32_t) (c - prev);
+        prev = c;
+    }
+    return n;
+}
+
+/// The entry an integer `m` in [0, sum of cnt) falls in, walking the counts in order (lane 0).
+__device__ __forceinline__ int ess_walk(const int32_t* cnt, int n, uint64_t m) {
+    uint64_t acc = 0;
+    for (int i = 0; i < n; ++i) {
+        acc += (uint64_t) (cnt[i] > 0 ? cnt[i] : 0);
+        if (m < acc) return i;
+    }
+    return n - 1;
+}
+
+/// The drafter's step with exact sampling: `coupled_merge_kernel`'s merge, the chain's final distribution as counts,
+/// the PROPOSAL draw at the verifying row's counter, the q list written out for the verify head.
+__global__ void __launch_bounds__(32)
+ess_draft_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kpart, const SamplerParams* __restrict__ dp,
+                       const int* __restrict__ step_rec, const int* __restrict__ sub_to_id, int* __restrict__ ring, int cap,
+                       int j, const int32_t* __restrict__ top_sub, int32_t* __restrict__ top_id,
+                       int32_t* __restrict__ out_id, EssQList* __restrict__ qlist) {
+    const int lane = (int) threadIdx.x;
+    const SamplerParams p = *dp;
+    const uint64_t counter = strata::core::coupled_draft_counter((int64_t) step_rec[0]);
+    const int k = sampled_k(p.top_k, nv);
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ int32_t cnt[kSelMax];
+    __shared__ int nq[1], pick[1];
+    for (int e = lane; e < n_blocks * kpart; e += 32) lists[e] = cand[e];
+    __syncwarp();
+    warp_merge_lists(lists, n_blocks, kpart, k, nv, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < nv ? id : 0; sel_logit[i] = v; }
+    });
+    __syncwarp();
+    if (p.greedy || p.temperature <= 0.0f) {   // never launched for greedy requests: a point mass at the argmax
+        if (lane == 0) { cnt[0] = kEssScale; nq[0] = 1; pick[0] = 0; }
+    } else {
+        const int n = ess_final_dist(sel_logit, k, p, ex);
+        if (lane == 0) {
+            nq[0] = ess_counts(ex, n, cnt);
+            const uint32_t m = ess_philox(p.seed, counter, kEssProposal).x >> 8;   // 24 bits: the counts' grid
+            pick[0] = ess_walk(cnt, nq[0], (uint64_t) m);
+        }
+    }
+    __syncwarp();
+    const int n = nq[0];
+    auto tok = [&](int s) { return sub_to_id != nullptr ? sub_to_id[s] : s; };
+    for (int i = lane; i < n; i += 32) { qlist->id[i] = tok(sel_ids[i]); qlist->cnt[i] = cnt[i]; }
+    if (lane == 0) {
+        qlist->n = n;
+        const int id = tok(sel_ids[pick[0]]);
+        *out_id = id;
+        ring[cap + j] = id;
+        *top_id = tok(*top_sub);
+    }
+}
+
+/// q(id) of a draft row: its list's count, a point mass at the draft when there is no list.
+__device__ __forceinline__ int32_t ess_q_of(const EssQList* q, int x, int id) {
+    if (q == nullptr) return id == x ? kEssScale : 0;
+    const int n = q->n;
+    for (int i = 0; i < n; ++i)
+        if (__ldg(&q->id[i]) == id) return __ldg(&q->cnt[i]);
+    return 0;
+}
+
+/// THE VERIFY HEAD WITH EXACT SAMPLING: one warp per row, the split merge of `sampler_split_merge_kernel`, then
+///   a row without a draft (t >= n_drafts): `sampled_tail_warp` - the bonus, today's pick with today's uniform;
+///   a row with a draft x: accept with probability min(1, P(x) / Q(x)) (ACCEPTANCE stream: 64 bits, accept iff
+///   floor(u * Q(x) / 2^64) < P(x)); else draw from the residual max(P - Q, 0) over the target's list (RESIDUAL stream,
+///   floor(u * R / 2^64)).  P and Q are integer counts out of 2^24 (the exact distributions the 24-bit draws make), so
+///   the residual is never empty after a rejection (Q(x) > P(x) and both sum to 2^24) and never holds x.
+__global__ void __launch_bounds__(32)
+sampler_spec_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k,
+                          const int32_t* __restrict__ drafts, const EssQList* __restrict__ qlists, int n_mtp,
+                          int n_drafts, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ int32_t cnt[kSelMax], res[kSelMax];
+    __shared__ int np[1];
+    const int2* src = cand + (size_t) t * n_blocks * k;
+    for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
+    __syncwarp();
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
+    });
+    __syncwarp();
+    if (t >= n_drafts) {                         // the bonus row (and any row past the drafts): today's draw
+        sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+        return;
+    }
+    const int n0 = ess_final_dist(sel_logit, k, p, ex);
+    if (lane == 0) np[0] = ess_counts(ex, n0, cnt);
+    __syncwarp();
+    const int n = np[0];
+    const int x = drafts[t];
+    const EssQList* q = t < n_mtp ? qlists + t : nullptr;
+    const uint64_t c = p.counter + (uint64_t) t;
+    int32_t px = 0;
+    for (int i = lane; i < n; i += 32) if (sel_ids[i] == x) px = cnt[i];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) px += __shfl_xor_sync(kFullMask, px, off);   // one entry at most
+    const int32_t qx = ess_q_of(q, x, x);
+    const bool accept = qx > 0 && __umul64hi(ess_u64(p.seed, c, kEssAccept), (uint64_t) qx) < (uint64_t) px;
+    if (accept) {
+        if (lane == 0) out[t] = x;
+        return;
+    }
+    for (int i = lane; i < n; i += 32) {
+        const int32_t r = cnt[i] - ess_q_of(q, x, sel_ids[i]);
+        res[i] = r > 0 ? r : 0;
+    }
+    __syncwarp();
+    if (lane == 0) {
+        uint64_t rsum = 0;
+        for (int i = 0; i < n; ++i) rsum += (uint64_t) res[i];
+        // rsum == 0 cannot happen after a rejection (see above); defensively, the target's own draw then
+        const uint64_t m = rsum > 0 ? __umul64hi(ess_u64(p.seed, c, kEssResidual), rsum) : 0;
+        const int i = rsum > 0 ? ess_walk(res, n, m) : ess_walk(cnt, n, (uint64_t) (ess_philox(p.seed, c, 0).x >> 8));
+        out[t] = sel_ids[i];
+    }
+}
+
 // Which sampled path runs, read once: `STRATA_OLD_SAMPLER=1` is `sampler_kernel` (engine 0.1.20),
 // `STRATA_SAMPLER_ONE_BLOCK=1` the one-block kernel; by default the split top_k wherever it applies.
 enum class SampledPath { Split, OneBlock, Old };
@@ -1430,6 +1648,61 @@ void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const in
                                              ring, cap, j, out_id, out_prob,
                                              qrows + (size_t) j * strata::core::kSpecQStride, gate_pick, tscale);
     coupled_check("spec_draft merge");
+}
+
+void ess_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,
+                      const SamplerParams* params, int32_t* ring, int cap, int j, const int32_t* step_rec, void* scratch,
+                      const int32_t* top_sub, int32_t* top_id, int32_t* out_id, EssQList* qlist, void* stream) {
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int n_blocks = coupled_blocks(nv), kpart = coupled_kpart(nv);
+    if (nv <= 0 || n_blocks > kSplitMaxBlocks || scratch == nullptr) {
+        std::fprintf(stderr, "ess_draft_sample: %d logits need scratch and at most %d blocks\n", nv, kSplitMaxBlocks);
+        std::exit(1);
+    }
+    coupled_penalize_kernel<<<1, 1024, (unsigned) ((nv + 31) / 32) * sizeof(unsigned), s>>>(logits, nv, id_to_sub,
+                                                                                           id_vocab, params, ring, cap, j);
+    coupled_check("ess_draft penalize");
+    sampler_split_part_kernel<<<dim3((unsigned) n_blocks, 1u), kSplitWarps * 32, 0, s>>>(
+        logits, nv, nullptr, 0, SamplerParams{}, kpart, n_blocks, (int2*) scratch);
+    coupled_check("ess_draft split part");
+    ess_draft_merge_kernel<<<1, 32, 0, s>>>((const int2*) scratch, n_blocks, nv, kpart, params, step_rec, sub_to_id, ring,
+                                            cap, j, top_sub, top_id, out_id, qlist);
+    coupled_check("ess_draft merge");
+}
+
+void sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, const int32_t* drafts, const EssQList* qlists, int n_mtp, int n_drafts,
+                        int* out, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    if (p.greedy || p.temperature <= 0.0f || n_drafts <= 0) {   // nothing to verify exactly: the plain head
+        sample_tokens(logits, n_tokens, n_vocab, history, history_len, p, out, stream);
+        return;
+    }
+    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) {
+        std::fprintf(stderr, "sample_tokens_spec: penalty_last_n %d needs a history\n", p.penalty_last_n);
+        std::exit(1);
+    }
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    int2* scratch = nullptr;
+    if (n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows && !stream_capturing(stream))
+        scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
+    if (scratch == nullptr) {
+        std::fprintf(stderr, "sample_tokens_spec: the split sampler cannot run here (%d logits, %d rows)\n", n_vocab,
+                     n_tokens);
+        std::exit(1);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0, s>>>(
+        logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
+    sampler_spec_merge_kernel<<<(unsigned) n_tokens, 32, 0, s>>>(scratch, n_blocks, n_vocab, p, k, drafts, qlists, n_mtp,
+                                                                 n_drafts < n_tokens ? n_drafts : n_tokens - 1, out);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "sample_tokens_spec launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
 }
 
 }  // namespace strata::kernels

@@ -22,8 +22,8 @@
 //     is in src/prefill/moe_fused_iq.cu's v2 section): v2 against the reference as above, within a tenth of the fused
 //     path's own error of its outputs, and timed next to it;
 //   - part 3: v2 against the current kernels on ONE grouping at chosen rows per expert (1 to 300: every partial n8 /
-//     n16 tile and 64- / 128-row item edge, an expert with none) in three launches - H's int8 codes (gate/up) at most
-//     one apart and rarely, its scales and the down rows at FP32 rounding, each mode (1 both, 2 gate/up, 3 down),
+//     n16 tile and 64- / 128-row item edge, an expert with none) in three launches - H (codes and scales) and the down
+//     rows the current kernels' bit for bit (r22 gap 16: v2 takes their term), each mode (1 both, 2 gate/up, 3 down),
 //     every byte the current kernels write written (two sentinels), nothing past the outputs touched, v2 the same bits
 //     twice, the all-zero token zero.
 // --v2: only the pairs v2 takes, parts 1 and 3 (and 2 unless --no-timing); exit 77 when v2 does not run on the device.
@@ -608,17 +608,11 @@ bool v2_part(const Pair& p, cudaStream_t s) {
                 p.name, E, (long long) rows, (long long) h1.moved, (long long) h1.codes, (long long) h1.far,
                 h1.scale_rel, v2gu ? "" : " (gate/up not v2: bitwise expected)", e1.rms, e1.worst);
     if (z != 0) throw std::runtime_error(std::string(p.name) + ": v2: the all-zero token's outputs are not zero");
-    if (v2gu) {
-        // ~1 ulp of h moves a code only at a rounding boundary: a handful of 1e5 codes, never by two
-        if (h1.far != 0 || (double) h1.moved > 2e-3 * (double) h1.codes || h1.scale_rel > 1e-5)
-            throw std::runtime_error(std::string(p.name) + ": v2 gate/up: H differs from the current kernels' beyond rounding");
-    } else if (!h1.bitwise) {
-        throw std::runtime_error(std::string(p.name) + ": H differs although gate/up ran the current kernels");
-    }
-    // the down rows: rounding only when H is the same; H's moved codes when it is not
-    const double rms_max = v2gu ? 1e-3 : 1e-5, worst_max = v2gu ? 2e-2 : 1e-4;
-    if (e1.rms > rms_max || e1.worst > worst_max)
-        throw std::runtime_error(std::string(p.name) + ": v2: the down rows differ from the current kernels' beyond rounding");
+    // r22 gap 16: v2 takes the current kernels' term, so H and the down rows are the current kernels' bit for bit
+    if (h1.moved != 0 || !h1.bitwise)
+        throw std::runtime_error(std::string(p.name) + ": v2: H is not the current kernels' bit for bit");
+    if (std::memcmp(r1.y.data(), r0.y.data(), db) != 0)
+        throw std::runtime_error(std::string(p.name) + ": v2: the down rows are not the current kernels' bit for bit");
     if (v2gu && v2d) {
         // mode 2: v2 gate/up alone - the same H as mode 1; mode 3: v2 down alone on the current kernels' H
         const Out r2 = run(2, 0x00), r3 = run(3, 0x00);
@@ -626,8 +620,8 @@ bool v2_part(const Pair& p, cudaStream_t s) {
         if (!hdiff(r3.h, r0.h).bitwise) throw std::runtime_error(std::string(p.name) + ": mode 3: H is not the current kernels'");
         const Err e3 = compare(r3.y, row, r0.y, row, (size_t) rows);
         std::printf("  mode 3 (v2 down alone, the same H): down rel RMS %.3e worst row %.3e\n", e3.rms, e3.worst);
-        if (e3.rms > 1e-5 || e3.worst > 1e-4)
-            throw std::runtime_error(std::string(p.name) + ": mode 3: the down rows differ beyond rounding");
+        if (std::memcmp(r2.y.data(), r0.y.data(), db) != 0 || std::memcmp(r3.y.data(), r0.y.data(), db) != 0)
+            throw std::runtime_error(std::string(p.name) + ": modes 2 / 3: the down rows are not the current kernels' bit for bit");
     }
     return true;
 }

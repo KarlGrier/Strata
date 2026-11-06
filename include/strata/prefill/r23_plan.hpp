@@ -36,4 +36,33 @@ inline AheadSlots ahead_slots(int layout_slots, int ring_cap, int stage_grp, int
     return a;
 }
 
+// ---- STRATA_PF_TAIL_SPLIT (after Basalt's equal chunks, MIT) ----
+// n tokens in chunks of C (the last the rest), stream-all from smin tokens, the switch's minimum rest tmin (> 0): when the
+// last chunk is a rest of at least tmin tokens but below smin (a staged chunk), it and the chunk before it become two
+// chunks of a = ceil((C + rest) / 2) rounded up to 256 (at most C) and C + rest - a, both at least smin, starting at
+// `at`.  Every earlier chunk stays C.
+struct TailSplit {
+    bool on = false;
+    bool staged_rest = false;    // the last chunk is below smin (what the switch is about)
+    int64_t at = -1, a = 0, b = 0, last = 0;
+    const char* why = nullptr;   // set when !on
+};
+inline TailSplit tail_split(int64_t n, int64_t C, int64_t smin, int64_t tmin) {
+    TailSplit t;
+    if (tmin <= 0) { t.why = "off"; return t; }
+    if (C <= 0 || n <= C) { t.why = "the prompt is one chunk"; return t; }
+    const int64_t k = (n + C - 1) / C, last = n - (k - 1) * C, r = C + last;
+    const int64_t a = std::min<int64_t>(C, ((r + 1) / 2 + 255) / 256 * 256);
+    t.last = last;
+    t.a = a;
+    t.b = r - a;
+    t.at = (k - 2) * C;
+    t.staged_rest = last < smin;
+    if (!t.staged_rest) { t.why = "the last chunk streams every expert (not a staged rest)"; return t; }
+    if (last < tmin) { t.why = "the rest is shorter than the switch's minimum"; return t; }
+    if (a < smin || r - a < smin) { t.why = "the two chunks would be below the stream-all size (the chunk is too small)"; return t; }
+    t.on = true;
+    return t;
+}
+
 }  // namespace strata::prefill::r23

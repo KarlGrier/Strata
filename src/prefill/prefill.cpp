@@ -3415,6 +3415,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // rest), for a chunk above the first one; it takes precedence over the tail split.
     const bool own_plan = forced == 0 && planned_C == 0 && hand_in_ == nullptr && next_ == nullptr && !kva_run &&
                           m.src != nullptr && m.ring > STAGE && C > 0 && n > C;   // a run that plans its own chunks
+    // (r23 fix: why a multi-chunk run does not plan its own chunks, for the switches' "not applied" lines)
+    const char* own_plan_why = forced > 0 ? "the engine forced this run's chunk" : planned_C > 0 ? "a --prefill-pipe plan"
+                             : hand_in_ != nullptr || next_ != nullptr ? "a layer split stage" : kva_run ? "a KVA run"
+                             : m.src == nullptr ? "no expert source"
+                             : m.ring <= STAGE ? "the layout's chunk is below the stream-all size (a staged layout)" : nullptr;
     int64_t first_len = 0, eq_len = 0;
     if (const int64_t f0 = pf_first_chunk(); f0 > 0 && own_plan && C > f0) {
         const int64_t rest = n - f0, k = (rest + C - 1) / C, smin = stream_all_min();
@@ -3428,15 +3433,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     }
     int64_t tail_at = -1, tail_a = 0;
-    if (const int64_t tmin = pf_tail_split_min(); tmin > 0 && own_plan && first_len == 0) {
-        const int64_t k = (n + C - 1) / C, last = n - (k - 1) * C, smin = stream_all_min();
-        const int64_t r = C + last, a = std::min<int64_t>(C, ((r + 1) / 2 + 255) / 256 * 256);
-        if (last >= tmin && last < smin && a >= smin && r - a >= smin) {
-            tail_at = (k - 2) * C;
-            tail_a = a;
+    if (const int64_t tmin = pf_tail_split_min(); tmin > 0 && first_len == 0 && hand_in_ == nullptr) {
+        // (r23_plan.hpp tail_split: the rule, and why it does not apply)
+        const int64_t smin = stream_all_min();
+        const r23::TailSplit ts = r23::tail_split(n, C, smin, tmin);
+        if (ts.on && own_plan) {
+            tail_at = ts.at;
+            tail_a = ts.a;
             std::fprintf(stderr, "strata prefill: STRATA_PF_TAIL_SPLIT: %lld tokens from %lld: the last %lld (a %lld-token chunk and "
                                  "a %lld-token rest) read as chunks of %lld and %lld tokens\n", (long long) n, (long long) pos0,
-                         (long long) r, (long long) C, (long long) last, (long long) a, (long long) (r - a));
+                         (long long) (C + ts.last), (long long) C, (long long) ts.last, (long long) ts.a, (long long) ts.b);
+        } else if (ts.staged_rest && C > 0 && n > C) {
+            // r23 fix: a staged rest the split leaves as it is, and why (the gate of 11-05: 0 plan lines and no reason -
+            // the yardstick's 1024-token chunk, where two halves of 1024 + rest are never both >= 1024)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_TAIL_SPLIT not applied: %lld tokens from %lld: the %lld-token rest after "
+                                 "%lld-token chunks stays a staged chunk (stream-all from %lld tokens, the switch takes rests of %lld or "
+                                 "more; the halves would be %lld and %lld): %s\n", (long long) n, (long long) pos0, (long long) ts.last,
+                         (long long) C, (long long) smin, (long long) tmin, (long long) ts.a, (long long) ts.b,
+                         own_plan_why != nullptr ? own_plan_why : ts.why);
         }
     }
     const auto chunk_len = [n, C, tail_at, tail_a, first_len, eq_len](int64_t at) -> int64_t {

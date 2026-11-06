@@ -1844,6 +1844,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                      pf_ahead_mode(), pf_ahead_max(),
                      pf_ahead_mode() == 2 ? ", and a short prompt's layout holds them" : ", in slots its layout already holds");
     }
+    // r23 fix: STRATA_PF_FIRST_CHUNK with a chunk that is not above its first chunk plans no prompt - said once, at the start
+    // (gap 11-05: the cap arm's --prefill auto:24576 had a ceiling of 16384, generate.cpp's auto:N rule)
+    if (static bool said_fc = false; pf_first_chunk() > 0 && (int64_t) chunk <= pf_first_chunk() && !said_fc) {
+        said_fc = true;
+        std::fprintf(stderr, "strata prefill: STRATA_PF_FIRST_CHUNK is set, but the prompt chunk is %lld tokens, not above the first chunk of %lld: "
+                             "it plans no prompt (--prefill auto:N takes 8192, 16384 or 32768 as its ceiling - auto:24576 is 16384; "
+                             "auto:32768 lets the scan pick the largest chunk that fits, an explicit --prefill N above %lld is N)\n",
+                     (long long) chunk, (long long) pf_first_chunk(), (long long) pf_first_chunk());
+    }
     if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_expert < 1 || ss.k != K) {
         err = "prefill: geometry differs from the artifact's"; return false;
     }
@@ -3421,15 +3430,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              : m.src == nullptr ? "no expert source"
                              : m.ring <= STAGE ? "the layout's chunk is below the stream-all size (a staged layout)" : nullptr;
     int64_t first_len = 0, eq_len = 0;
-    if (const int64_t f0 = pf_first_chunk(); f0 > 0 && own_plan && C > f0) {
-        const int64_t rest = n - f0, k = (rest + C - 1) / C, smin = stream_all_min();
-        const int64_t e = std::min<int64_t>(C, ((rest + k - 1) / k + 255) / 256 * 256);
-        if (k > 1 || rest >= smin) {
+    if (const int64_t f0 = pf_first_chunk(); f0 > 0 && hand_in_ == nullptr && C > 0 && n > C) {
+        // (r23_plan.hpp first_chunk: the rule, and why it does not apply)
+        const r23::FirstChunk fc = r23::first_chunk(n, C, f0, stream_all_min());
+        if (fc.on && own_plan) {
             first_len = f0;
-            eq_len = e;
+            eq_len = fc.e;
             std::fprintf(stderr, "strata prefill: STRATA_PF_FIRST_CHUNK: %lld tokens from %lld: a first chunk of %lld, then %lld "
                                  "chunk(s) of at most %lld (the chunk is %lld)\n", (long long) n, (long long) pos0, (long long) f0,
-                         (long long) k, (long long) e, (long long) C);
+                         (long long) fc.k, (long long) fc.e, (long long) C);
+        } else {
+            // r23 fix: a multi-chunk prompt the switch does not plan, and why (the gate of 11-05: --prefill auto:24576
+            // gave a 16384-token chunk, see Prefill::init's line, and the yardstick's engine reads in 1024-token chunks)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_FIRST_CHUNK not applied: %lld tokens from %lld in %lld-token chunks (a "
+                                 "first chunk of %lld): %s\n", (long long) n, (long long) pos0, (long long) C, (long long) f0,
+                         own_plan_why != nullptr ? own_plan_why : fc.why);
         }
     }
     int64_t tail_at = -1, tail_a = 0;

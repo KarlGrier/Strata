@@ -71,6 +71,36 @@ int main() {
         }
     }
 
+    // ---- STRATA_PF_FIRST_CHUNK=1 (a first chunk of 16384) ----
+    // the served chunk 16384, and the gate's cap arm at --prefill auto:24576 (its ceiling was 16384): nothing, said why
+    {
+        const FirstChunk f = first_chunk(66609, 16384, 16384, 1792);
+        CHECK(!f.on && std::strstr(f.why, "not above the first chunk") != nullptr);
+        CHECK(!first_chunk(66609, 8192, 16384, 1792).on);
+        CHECK(!first_chunk(66609, 1024, 16384, 1024).on);   // the yardstick's 1024 chunk
+    }
+    // a chunk above it (the commit's example, 66,617 at C 20480 -> 16384 + 3 x 16,896 + the rest; 66,616 read in a batch)
+    {
+        const FirstChunk f = first_chunk(66616, 20480, 16384, 1792);
+        CHECK(f.on && f.f0 == 16384 && f.rest == 50232 && f.k == 3 && f.e == 16896 && f.why == nullptr);
+        const FirstChunk g = first_chunk(33187, 21504, 16384, 1024);   // a tail24 cut at a 21504 chunk: 16384 + 16803
+        CHECK(g.on && g.k == 1 && g.e == 16896 && g.rest == 16803);
+        const FirstChunk h = first_chunk(17000, 16640, 16384, 1792);   // the rest would be one staged chunk (616 < 1792)
+        CHECK(!h.on && h.k == 1 && std::strstr(h.why, "staged") != nullptr);
+        CHECK(first_chunk(17000, 16640, 16384, 512).on);                // ... not below a 512 stream-all size
+        CHECK(!first_chunk(20000, 21504, 16384, 1024).on);              // one chunk
+        CHECK(!first_chunk(66616, 20480, 0, 1792).on);                  // off
+    }
+    // whenever it applies: the chunks cover n, none is above C, only the last may be shorter than e
+    for (int64_t C : {16640, 20480, 21504, 24576, 32768}) {
+        for (int64_t n = C + 1; n < 140000; n += 211) {
+            const FirstChunk f = first_chunk(n, C, 16384, 1792);
+            if (!f.on) continue;
+            CHECK(f.e <= C && f.e % 256 == 0 && (f.k - 1) * f.e < f.rest && f.k * f.e >= f.rest);
+            CHECK(f.k > 1 || f.rest >= 1792);
+        }
+    }
+
     if (failed) {
         std::fprintf(stderr, "r23_plan_test: %d check(s) failed\n", failed);
         return 1;

@@ -65,4 +65,27 @@ inline TailSplit tail_split(int64_t n, int64_t C, int64_t smin, int64_t tmin) {
     return t;
 }
 
+// ---- STRATA_PF_FIRST_CHUNK (after Basalt e8f3b84b, MIT) ----
+// n tokens with a chunk C above the first chunk f0: the first f0 tokens as one chunk, the rest in k = ceil(rest / C)
+// chunks of e = ceil(rest / k) rounded up to 256 (at most C; the last the rest), when that leaves no staged chunk
+// (k > 1, or the rest at least smin).
+struct FirstChunk {
+    bool on = false;
+    int64_t f0 = 0, k = 0, e = 0, rest = 0;
+    const char* why = nullptr;   // set when !on
+};
+inline FirstChunk first_chunk(int64_t n, int64_t C, int64_t f0, int64_t smin) {
+    FirstChunk f;
+    f.f0 = f0;
+    if (f0 <= 0) { f.why = "off"; return f; }
+    if (C <= f0) { f.why = "the chunk is not above the first chunk"; return f; }
+    if (n <= C) { f.why = "the prompt is one chunk"; return f; }
+    f.rest = n - f0;
+    f.k = (f.rest + C - 1) / C;
+    f.e = std::min<int64_t>(C, ((f.rest + f.k - 1) / f.k + 255) / 256 * 256);
+    if (!(f.k > 1 || f.rest >= smin)) { f.why = "the rest would be one staged chunk"; return f; }
+    f.on = true;
+    return f;
+}
+
 }  // namespace strata::prefill::r23

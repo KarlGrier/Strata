@@ -8,6 +8,7 @@
 #endif
 #include "strata/prefill/warm_policy.hpp"
 #include "strata/prefill/share_rules.hpp"
+#include "strata/prefill/r23_plan.hpp"   // r23: the prompt-path switches' rules (STRATA_PF_AHEAD, _TAIL_SPLIT, _FIRST_CHUNK)
 #include "strata/core/arch_defaults.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -1274,6 +1275,8 @@ struct Prefill::Impl {
     int64_t ahead_layer[2] = {-1, -1};
     cudaEvent_t ahead_ev = nullptr;          // where on the compute stream the copies ahead may start
     int64_t ahead_copied = 0, ahead_used = 0;
+    int64_t ahead_staged = 0;                // this run's staged chunks (where the switch applies), for its one line
+    const char* ahead_why = nullptr;         // why a staged chunk of this run copied nothing ahead (the first reason)
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -2203,6 +2206,12 @@ bool Prefill::carve(size_t T, void* alloc) {
     take_stage(o, ss, s, m.stage, ok);
     m.T = (int64_t) T;
     m.group_cap = pf_group_scratch() && !m.fused_bufs ? group_cap_rows(T, m.g->n_expert) : 0;
+    // r23 (STRATA_PF_AHEAD / _TAIL_SPLIT / _FIRST_CHUNK set): the layout these switches work in, once per layout - the gate
+    // of 11-05 assumed the served 16384-token chunk where the yardstick's engine had laid out 1024 (nothing lendable)
+    if (pf_ahead_mode() != 0 || pf_tail_split_min() > 0 || pf_first_chunk() > 0)
+        std::fprintf(stderr, "strata prefill: r23 switches: a layout for %zu-token chunks (stream-all from %lld tokens, %d staging "
+                             "slots, a %d-slot ring; the staged walk takes %d)\n", T, (long long) stream_all_min(),
+                     nstage, m.ring, STAGE_GRP);
     if (m.group_cap > 0 || hcr) {   // activation evidence: once per layout (a chunk size), what the switches took
         std::fprintf(stderr, "strata prefill: chunk %zu tokens:%s%s\n", T,
                      m.group_cap > 0 ? (" STRATA_PF_GROUP_SCRATCH on (GU/H/Hq hold " + std::to_string(m.group_cap) + " rows, not " +
@@ -3321,7 +3330,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
-    m.ahead_copied = m.ahead_used = 0;   // STRATA_PF_AHEAD: this run's counts
+    m.ahead_copied = m.ahead_used = m.ahead_staged = 0;   // STRATA_PF_AHEAD: this run's counts
+    m.ahead_why = nullptr;
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
     const KvaConfig& kva = kva_config();
@@ -4071,11 +4081,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // next layer's routing in its MoE half and copies the likely experts ahead, into the layout's own staging slots
         // past STAGE_GRP (the staged walk takes at most STAGE_GRP), `ahead_n` per layer parity.  Not on a multi-GPU
         // prompt path (m.pp), a KVA run, or a chunk with no expert source or cache.
-        const int ahead_room = std::min<int>(m.ring_room_at, ring_cap());   // this layout's own staging slots
+        // (r23_plan.hpp ahead_slots: the layout's own staging slots m.ring_room_at, never past ring_cap(); a layout laid
+        // out for a chunk below the stream-all size has none past STAGE_GRP.)  r23 fix: every staged chunk is counted and
+        // the first reason one copied nothing is kept, for the run's line (the gate of 11-05 saw no line at all).
+        const r23::AheadSlots aslots = r23::ahead_slots(m.ring_room_at, ring_cap(), STAGE_GRP, pf_ahead_max());
         int ahead_n = 0;
+        if (pf_ahead_mode() != 0 && !stream_all) {
+            ++m.ahead_staged;
+            const char* why = m.src == nullptr || m.cache == nullptr || m.host_res == nullptr ? "no expert source or cache"
+                            : m.pp ? "a multi-GPU prompt path" : kva_run ? "a KVA run" : LE - LB <= 1 ? "a one-layer stage"
+                            : m.guess_failed ? "the routing guess's buffers could not be had" : aslots.why;
+            if (why != nullptr && m.ahead_why == nullptr) m.ahead_why = why;
+        }
         if (pf_ahead_mode() != 0 && !stream_all && m.src != nullptr && m.cache != nullptr && m.host_res != nullptr &&
-            !m.pp && !kva_run && LE - LB > 1 && ahead_room > STAGE_GRP && !m.guess_failed) {
-            ahead_n = std::min(pf_ahead_max(), (ahead_room - STAGE_GRP) / 2);
+            !m.pp && !kva_run && LE - LB > 1 && aslots.per_parity > 0 && !m.guess_failed) {
+            ahead_n = aslots.per_parity;
             if (ahead_n > 0 && m.guess_cap < T * K) {   // the guess buffers, outside the loan, at the largest staged chunk
                 const int64_t rows = std::max<int64_t>(T, stream_all_min() - 1) * K;
                 if (m.guess_ids) (void) cudaFree(m.guess_ids);
@@ -6487,10 +6507,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata KV prefetch: %lld layer prefixes, single existing staging pool\n",
                      (long long) kv_prefetches);
     }
-    if (pf_ahead_mode() != 0 && m.ahead_copied > 0)   // STRATA_PF_AHEAD: one line per prompt that copied ahead
-        std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD=%d: %lld experts copied ahead of their layer's routing, %lld read "
-                             "in place (%.0f%%)\n", pf_ahead_mode(), (long long) m.ahead_copied, (long long) m.ahead_used,
-                     100.0 * (double) m.ahead_used / (double) m.ahead_copied);
+    // STRATA_PF_AHEAD: one line per prompt with a staged chunk - what was copied ahead and read in place, or why nothing was
+    // (r23 fix: before, a prompt that copied nothing printed nothing; the gate could not tell "not exercised" from "not run")
+    if (pf_ahead_mode() != 0 && m.ahead_staged > 0) {
+        const r23::AheadSlots sl = r23::ahead_slots(m.ring_room_at, ring_cap(), STAGE_GRP, pf_ahead_max());
+        if (m.ahead_copied > 0)
+            std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD=%d: %lld experts copied ahead of their layer's routing, %lld read "
+                                 "in place (%.0f%%); %lld staged chunk(s) of %lld tokens from %lld, a %lld-token layout, %d slots per "
+                                 "layer parity\n", pf_ahead_mode(), (long long) m.ahead_copied, (long long) m.ahead_used,
+                         100.0 * (double) m.ahead_used / (double) m.ahead_copied, (long long) m.ahead_staged, (long long) n,
+                         (long long) pos0, (long long) m.T, sl.per_parity);
+        else
+            std::fprintf(stderr, "strata prefill: STRATA_PF_AHEAD=%d: 0 experts copied ahead of their layer's routing, 0 read in place; "
+                                 "%lld staged chunk(s) of %lld tokens from %lld, a %lld-token layout (stream-all from %lld tokens, %d "
+                                 "staging slots): %s\n", pf_ahead_mode(), (long long) m.ahead_staged, (long long) n, (long long) pos0,
+                         (long long) m.T, (long long) stream_all_min(), std::min(m.ring_room_at, ring_cap()),
+                         m.ahead_why != nullptr ? m.ahead_why
+                                                : "no expert was guessed more rows than the CPU share takes (not resident, page-locked)");
+    }
     stats_.ms_total += ms_since(t_start);
     {
         static const bool f16_range = std::getenv("STRATA_F16_RANGE") != nullptr;

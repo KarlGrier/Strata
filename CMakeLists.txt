@@ -398,6 +398,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
 
+  # r23's prompt-path switches (STRATA_PF_AHEAD / _TAIL_SPLIT / _FIRST_CHUNK): their rules and reasons, header-only, no GPU
+  add_executable(r23_plan_test tests/prefill/r23_plan_test.cpp)
+  target_include_directories(r23_plan_test PRIVATE include)
+  add_test(NAME r23_plan_test COMMAND r23_plan_test)
+
   # STRATA_PREFILL_ROUTED_STREAM: the prompt stream's issuer walk and route gate, on a simulated link and consumer
   # (header-only, no GPU)
   add_executable(routed_stream_test tests/prefill/routed_stream_test.cpp)

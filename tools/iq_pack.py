@@ -442,7 +442,8 @@ def expert_layout(model: Model, src: pathlib.Path):
     # drafter loads its own 512 experts from tools/mtp_rt.py's rt/experts.bin.  Emitting a
     # nextn row therefore only makes the pack unloadable ("a malformed line").  Subtract the
     # declared nextn blocks so native_experts.txt covers the trunk exactly.  Absent key -> 0.
-    nextn = int(model.files[0].metadata.get("qwen4exp.nextn_predict_layers", 0) or 0)
+    files = getattr(model, "files", None)          # upstream's v0.2.11 tests build a model without files
+    nextn = int(files[0].metadata.get("qwen4exp.nextn_predict_layers", 0) or 0) if files else 0
     n_layers = 1 + max(int(n.split(".")[1]) for n in exps) - nextn
     n_expert = int(T["blk.0.ffn_gate_inp.weight"].shape[1])   # router rows = experts kept (pruned models ship < 512)
     if any(int(T["blk.%d.ffn_gate_inp.weight" % l].shape[1]) != n_expert for l in range(n_layers)):

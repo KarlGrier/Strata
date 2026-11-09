@@ -6896,6 +6896,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
+        done = None                                      # per round: a round must bring its own end event
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
             if kind == "done":
                 done = x
@@ -6915,6 +6916,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                 elif ev.kind == "reasoning":
                     reasoning.append(ev.text)
             yield kind, x
+        if done is None:                                 # the round ended without its end event: end without one too,
+            return                                       # so openai_chunks' lost-answer guard (#3961) sees it
         total += done["completion_tokens"]
         run_them = calls and not own_calls and not finalizing and done["finish"] == "stop" and not cancel.is_set()
         if not run_them:

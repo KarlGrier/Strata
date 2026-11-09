@@ -19,6 +19,7 @@
 //      rounding from reduction order, and graph replay must preserve the precision chosen at capture.
 //   6. `gr_write`'s `2*sigmoid`, which centres the gate on 1 so a ZERO injection is a plain residual add.
 //      Asserted as a property, not as a value, because that is what the source comment claims.
+#include "strata/core/geometry.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -278,7 +279,10 @@ int scalar_activation_contract() {
 int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
                            const uint16_t* d_inject, float eps) {
     using namespace strata::kernels;
-    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
+    // (r23 port, test only: the fused read is compiled for the build's geometry, so the buffers and sizes come from it -
+    // with Flash-Next's literals a q4_big build read past them: Xid 31, an MMU fault, 11-09; q4_mid gave 6 wrong results)
+    constexpr int N = (int) strata::core::kCompiledGeometry.n_embd, HC = (int) strata::core::kCompiledGeometry.hc,
+                  LR = (int) strata::core::kCompiledGeometry.hc_lr, D = N * HC, T = kFusedGrMaxT;
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
     std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
@@ -952,10 +956,11 @@ int main(int argc, char** argv) {
                 streams_ok ? "yes" : "*** NO ***", worst_stream);
     if (!streams_ok) ++bad;
 
-    // ---- THE REAL DIMENSIONS. Exercise all activation/projection variants at n_embd=2560, hc=4, hc_lr=320.
+    // ---- THE REAL DIMENSIONS (the compiled geometry's; 2560 / 4 / 320 for Flash-Next). Exercise all activation/projection variants.
     // Workspace sizing and every full weight row must agree with the model geometry.
     {
-        const long long rn = 2560, rhc = 4, rlr = 320, rdim = rhc * rn;
+        const long long rn = strata::core::kCompiledGeometry.n_embd, rhc = strata::core::kCompiledGeometry.hc,
+                        rlr = strata::core::kCompiledGeometry.hc_lr, rdim = rhc * rn;   // (r23 port: was 2560 / 4 / 320)
         std::mt19937 rrng(99);
         std::normal_distribution<float> rg(0.0f, 1.0f);
         auto rbf16 = [&](size_t n, float sigma) {
@@ -1011,7 +1016,7 @@ int main(int argc, char** argv) {
             reference(rR, rnorm, rdown, rup, rinj, eps, rn, rhc, rlr, precision, wm, wi);
             const double rm = rel_diff(wm, gm), ri = rel_diff(wi, gi);
             const bool ok = rm <= 1e-4 && ri <= 1e-4;
-            std::printf("\n  real dims 2560/4/320 %s %s (mixed %.3e, inject %.3e)\n",
+            std::printf("\n  real dims %lld/%lld/%lld %s %s (mixed %.3e, inject %.3e)\n", rn, rhc, rlr,
                         activation_mode_name(mode), ok ? "pass" : "*** FAIL ***", rm, ri);
             if (!ok) ++bad;
         }

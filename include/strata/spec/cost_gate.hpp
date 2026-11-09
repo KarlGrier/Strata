@@ -7,7 +7,13 @@
 // whose raw top probability falls in p's bin (FILE: measured on recorded research traffic), theta(d) = the decode rate
 // times the extra time of a window with one more row (W(d+2) - W(d+1), measured).
 // The length still depends only on the drafter's raw probabilities, read before any draw, so exact speculative
-// sampling stays distribution-preserving (spec_exact.hpp); greedy and lookup windows are unchanged.
+// sampling stays distribution-preserving (spec_exact.hpp).  The gate sizes every MTP window, greedy ones too (it
+// regroups them: patches/LEDGER.md row 26); lookup windows are unchanged.
+// The table prices the steps its theta list covers (steps(): 3 in configs/r12-cost-gate.txt, fitted at --spec 4).  Past
+// them the gate has no cost data, and the window goes on by the --spec-min-p rule, as it would without the gate.  (Until
+// 2026-10-21 the gate stopped there - theta 1e9 - which capped every window at steps() drafts above --spec 4: at
+// --spec 7 our greedy struct run drafted 3.00 per window where stock v0.2.1 drafts 5.91.)  At --spec <= steps() + 1
+// nothing changed.
 // FILE format (text): "bins N" (edges i/N, i = 0..N; bin = the number of edges <= p, numpy's digitize), "theta t0 t1 t2 ..."
 // then lines "alpha d bin value"; a missing bin uses "default d value".
 #pragma once
@@ -39,6 +45,8 @@ struct CostGate {
         return jt != def.end() ? jt->second : 0.0;
     }
     double th(int d) const { return d < (int) theta.size() ? theta[(size_t) d] : 1e9; }
+    /// The draft steps the table prices (its theta list); the steps past them go by --spec-min-p.
+    int steps() const { return (int) theta.size(); }
 };
 
 /// STRATA_COST_GATE=FILE, read once.
@@ -79,17 +87,24 @@ inline const CostGate& cost_gate() {
     return g;
 }
 
-/// The window size the gate gives for drafts with raw top probabilities dprob[0 .. S-2] (S = the most rows).
-inline int cost_gate_T(const float* dprob, int S) {
-    const CostGate& g = cost_gate();
+/// The window size the gate `g` gives for drafts with raw top probabilities dprob[0 .. S-2] (S = the most rows): the
+/// steps its table prices by its rule, the steps past them by --spec-min-p (`min_p`).
+inline int cost_gate_T(const CostGate& g, const float* dprob, int S, float min_p) {
     int T = 1;
     double P = 1.0;
     while (T < S) {
+        if (T - 1 >= g.steps()) {   // past the table: the --spec-min-p rule (a step the drafter did not run has 0)
+            if (!(dprob[T - 1] >= min_p)) break;
+            ++T;
+            continue;
+        }
         P *= g.a(T - 1, dprob[T - 1]);
         if (P < g.th(T - 1)) break;
         ++T;
     }
     return T;
 }
+/// The same with STRATA_COST_GATE's table.
+inline int cost_gate_T(const float* dprob, int S, float min_p) { return cost_gate_T(cost_gate(), dprob, S, min_p); }
 
 }  // namespace strata::spec

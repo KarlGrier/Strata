@@ -1326,7 +1326,7 @@ template <bool GU> struct V2 {
     // of a decode load fall in distinct banks)
     static constexpr int SLOT = 112;
     static constexpr int NP = SLOT / 16;
-    static constexpr int NFB = (GU ? 1280 : 2560) / V2_WR;  // items per routed-row pair of tiles
+    static constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / V2_WR;   // items per routed-row pair of tiles (5 / 10 for Flash-Next)
     static constexpr int ACT_LD = K / 64 * AB;              // bytes per activation row (a token, or a row of H)
     static constexpr int OFF_RAW = 2 * V2_ACT;
     static constexpr int RAWBUF = V2_WR * SLOT;
@@ -1340,6 +1340,8 @@ template <bool GU> struct V2 {
 };
 // the header's numbers (the patch guard reads them there) are these kernels'
 static_assert(GU_ROWS_K == kV2Embd && D_ROWS_K == kV2FF, "moe_fused_iq.hpp: kV2Embd / kV2FF");
+static_assert(V2_WR == 256 && (!kV2Shape || (GU_ROWS_N % V2_WR == 0 && D_ROWS_N % V2_WR == 0 && D_ROWS_K % 128 == 0)),
+              "moe_fused_iq.hpp: kV2Shape is the v2 tiling's rule");
 static_assert(V2<true>::SMEM == kV2SharedBytes && V2<false>::SMEM <= kV2SharedBytes, "moe_fused_iq.hpp: kV2SharedBytes");
 static_assert((int) sizeof(block_iq3_xxs) == V2<true>::RB && 4 * (int) sizeof(block_iq4_nl) == V2<false>::RB,
               "v2: the raw units");
@@ -1561,7 +1563,7 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
                     const float am = fmaxf(acc[0][n][2 + cc], sam[(warp ^ 1) * V2_NR + r]);
                     if (r < nrows) {
                         const float inv = am > 0.0f ? 127.0f / am : 0.0f;
-                        uint8_t* o = out + (size_t) (row0 + r) * (10 * AB) + (blk >> 1) * AB;
+                        uint8_t* o = out + (size_t) (row0 + r) * H_ROW_BYTES + (blk >> 1) * AB;   // (800 B for Flash-Next)
 #pragma unroll
                         for (int i = 0; i < 2; ++i)
                             o[32 * hh + 16 * (warp & 1) + 8 * i + g] =
@@ -1578,7 +1580,7 @@ v2_kernel(const Batch b, const NativeGeom geo, const Tables tb, const uint8_t* _
                     for (int q = 0; q < 4; ++q) {
                         const int r = 8 * n + 2 * (int) t + (q & 1);
                         if (r < nrows)
-                            dm[(size_t) (row0 + r) * 2560 + V2_WR * fb + 32 * warp + 16 * i + 8 * (q >> 1) + g] =
+                            dm[(size_t) (row0 + r) * kMoeEmbd + V2_WR * fb + 32 * warp + 16 * i + 8 * (q >> 1) + g] =
                                 acc[i][n][q];
                     }
         }
@@ -2512,9 +2514,10 @@ int native_v2_mode() {
 bool native_v2_requested() { return native_v2_mode() != 0; }
 void native_v2_override(int mode) { g_v2_override.store(mode); }
 #if !defined(__HIPCC__)
-bool native_v2_built() { return true; }
-bool native_v2_ready() { return v2_occ() > 0; }
+bool native_v2_built() { return kV2Shape; }
+bool native_v2_ready() { return kV2Shape && v2_occ() > 0; }
 bool native_v2_takes(int type, bool gate_up) {
+    if (!kV2Shape) return false;   // (v0.2.13 port: a shape the v2 tiling does not take keeps the current kernels)
     const int m = native_v2_mode();
     return gate_up ? (m == 1 || m == 2) && type == T_IQ3_XXS : (m == 1 || m == 3) && type == T_IQ4_NL;
 }

@@ -64,7 +64,11 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
 
 /// The v2 kernels' compiled shapes: K of gate/up (n_embd) and of down (the experts' n_ff), and the dynamic shared memory
 /// of the larger one (gate/up; down needs 1,024 bytes less).  The patch guard compares them with the model and the GPUs.
-constexpr int kV2Embd = 2560, kV2FF = 640;
+/// v0.2.13 port (Karl 11-09: generalised as upstream's b273c8006 did for its kernels): the compiled geometry's
+/// (2560 / 640 for Flash-Next). kV2Shape: the shapes the v2 tiling takes - 2 n_ff and n_embd in whole 256-row items,
+/// n_ff in whole 128-value chunks (IQ4_NL down); at another shape v2 is not built and the current kernels run.
+constexpr int kV2Embd = kMoeEmbd, kV2FF = kMoeFF;
+constexpr bool kV2Shape = (2 * kMoeFF) % 256 == 0 && kMoeEmbd % 256 == 0 && kMoeFF % 128 == 0;
 constexpr int kV2SharedBytes = 99856;
 /// The bytes group_bytes() adds past the grouping tables for the v2 item counters, when v2 is asked for.  A buffer that
 /// was sized while v2 was off and then runs it under native_v2_override() (the tests) adds them itself.

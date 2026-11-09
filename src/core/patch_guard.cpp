@@ -225,6 +225,9 @@ int run_patch_guards(const ModelFacts& f) {
          [](const ModelFacts& m) -> std::string {
              if (!prefill_v2_asked()) return "";   // off (the default): the patch is inactive
              namespace F = strata::prefill::fused;
+             if (!F::kV2Shape)   // v0.2.13 port: the compiled shape is not one the v2 tiling takes
+                 return "this build's n_embd " + str(F::kV2Embd) + " / expert n_ff " + str(F::kV2FF) +
+                        " is not whole 256-row items and 128-value chunks: v2 is not built";
              if (m.n_embd != F::kV2Embd || m.n_ff != F::kV2FF)
                  return "n_embd " + str(m.n_embd) + ", expert n_ff " + str(m.n_ff) + "; compiled for " + str(F::kV2Embd) +
                         " / " + str(F::kV2FF);

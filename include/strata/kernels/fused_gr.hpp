@@ -83,6 +83,9 @@ constexpr int64_t kGrForkScratchMin = 2 * kGrForkScratchFloats;
 bool fused_gr_fork_enabled();
 /// round 13: n_embd, streams and low rank the fork read (and this file's reads) are compiled for (the patch guard)
 void fused_gr_fork_geometry(int& n, int& hc, int& lr);
+/// v0.2.13 port (Karl 11-09): false when the compiled shape is not Flash-Next's 2560 / 4 / 320 (the fork read is built for that
+/// shape only; STRATA_GR_FORK then stays off)
+bool fused_gr_fork_built();
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);

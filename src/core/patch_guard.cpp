@@ -195,6 +195,9 @@ int run_patch_guards(const ModelFacts& f) {
          [] { setenv_off("STRATA_QSA_SPLIT_ATTN", "0"); }},
         {"gr_fork", "B.1: fork Eddoursul's hyper-connection read", "STRATA_GR_FORK=0",
          [gr_n, gr_hc, gr_lr](const ModelFacts& m) -> std::string {
+             if (!strata::kernels::fused_gr_fork_built())   // v0.2.13 port (Karl 11-09): Flash-Next's shape only
+                 return "this build is compiled for n_embd " + str(gr_n) + ", " + str(gr_hc) + " streams, low rank " + str(gr_lr) +
+                        "; the fork read is built for Flash-Next's 2560 / 4 / 320 only";
              if (m.n_embd != gr_n || m.hc != gr_hc || m.hc_lr != gr_lr)
                  return "n_embd " + str(m.n_embd) + ", " + str(m.hc) + " streams, low rank " + str(m.hc_lr) +
                         "; compiled for " + str(gr_n) + " / " + str(gr_hc) + " / " + str(gr_lr);

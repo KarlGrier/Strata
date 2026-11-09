@@ -2840,13 +2840,17 @@ namespace {
 namespace strata::kernels {
 namespace {
 namespace fk {
+// v0.2.13 port (Karl 11-09, option (a)): the fork read is built for Flash-Next's hyper-connection shape only (n_embd 2560,
+// 4 streams, low rank 320; any layer count). At another shape its tiling below does not hold: the asserts do not bind,
+// nothing launches it, fused_gr_fork_enabled() is false and the patch guard turns STRATA_GR_FORK off (upstream's read runs).
+constexpr bool kForkBuilt = N == 2560 && HC == 4 && LR == 320;
 constexpr int NR = LR + HC;     // the down projection's rows: w_down's 320, then w_inject's 4
 constexpr int DG = 4, DS = 20, DW = 9, DR = 9, DT = 4;
 constexpr int DTH = DW * 32, DRB = DW * DR, DCS = D / DS, DSPC = DS / HC, DSTEPS = DCS / 256, DNF = DCS / 4;
-static_assert(DRB * DG == NR && DCS % 256 == 0 && DS % HC == 0 && DNF <= DTH, "down geometry");
+static_assert(!kForkBuilt || (DRB * DG == NR && DCS % 256 == 0 && DS % HC == 0 && DNF <= DTH), "down geometry");
 constexpr int UPM_ROWS = HC * UPM_COLS / WARPS;   // 8
 constexpr int SC_CTR = 0, SC_SSP = 64, SC_PART = SC_SSP + DG * DS * DT, SC_FLOATS = SC_PART + DS * DT * NR;
-static_assert(SC_FLOATS <= kGrForkScratchFloats, "fork scratch");
+static_assert(!kForkBuilt || SC_FLOATS <= kGrForkScratchFloats, "fork scratch");
 
 __device__ __forceinline__ float dot8h(const uint4 w, const float4 x0, const float4 x1) {
     float acc = 0.0f;
@@ -3130,7 +3134,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     }
     // round 11 B.1: STRATA_GR_FORK=1 - fork Eddoursul's read (another summation order; before v3 / v5)
     static const bool gr_fork = [] { const char* v = std::getenv("STRATA_GR_FORK"); return v != nullptr && std::atoi(v) != 0; }();
-    if (gr_fork) {
+    if (fk::kForkBuilt && gr_fork) {   // (v0.2.13 port: built for Flash-Next's shape only)
         fk::launch_fork(m, xn_scratch, st, stamp_buf, stamp_i0);
         const cudaError_t ef = cudaGetLastError();
         if (ef != cudaSuccess) {
@@ -3363,8 +3367,11 @@ void fused_gr_fork_geometry(int& n, int& hc, int& lr) { n = N; hc = HC; lr = LR;
 
 bool fused_gr_fork_enabled() {
     static const bool on = [] { const char* v = std::getenv("STRATA_GR_FORK"); return v != nullptr && std::atoi(v) != 0; }();
-    return on;
+    return fk::kForkBuilt && on;
 }
+
+// v0.2.13 port: whether this build's shape is the one the fork read is built for (the patch guard)
+bool fused_gr_fork_built() { return fk::kForkBuilt; }
 
 bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
     return n_embd == N && hc == HC && hc_lr == LR;

@@ -14067,6 +14067,10 @@ int main(int argc, char** argv) {
                 M.engine("spec_window", std::to_string(o.spec));
                 M.engine("pipeline_windows", std::to_string(o.pipeline_windows));
                 M.engine("ple_io", o.ple_io);
+                // v0.2.13 port: the GDN switches as resolved (v0.2.13 sets STRATA_GDN_TC=1 / STRATA_GDN_CONVL2=2 by default on
+                // CUDA unless the user set them; the port config pins both to 0)
+                M.engine("gdn_tc", [] { const char* v = std::getenv("STRATA_GDN_TC"); return std::string(v ? v : "unset"); }());
+                M.engine("gdn_convl2", [] { const char* v = std::getenv("STRATA_GDN_CONVL2"); return std::string(v ? v : "unset"); }());
                 M.engine("expert_cache_request", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache));
                 M.budget("max_context", (int64_t) o.max_context);
                 M.budget("kv_resident_cells", (int64_t) o.kv_resident);

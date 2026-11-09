@@ -57,6 +57,7 @@ function fitHeader() {}
 const requestAnimationFrame = () => {};
 async function loadHealth() { await fetch("health"); }
 async function loadMcp() { await fetch("v1/mcp"); }
+async function loadWeb() { await fetch("web"); }       // the Web search switch's settings (a GET, as the page's own)
 function showTab(name) { focus.push("tab:" + (name || "chat")); }
 async function send() { sends.push(input.value); await fetch("v1/chat/completions", {method: "POST", headers: {Authorization: "Bearer saved-key"}}); }
 %(autosize)s

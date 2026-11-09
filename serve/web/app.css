@@ -341,3 +341,8 @@ main { flex: 1; min-height: 0; display: flex; }
 /* a message may use the room a wide window gives the chat column (#3176 widened the column; the kit's 720px kept the messages narrow in it) */
 .st-msg { max-width: min(100%, 900px); }
 .st-toast .st-btn { white-space: nowrap; }
+
+/* the composer's Web search switch (serve/websearch.py): outlined when off, accent-tinted when on */
+.web-toggle { height: 32px; padding: 0 12px; gap: 6px; font-size: var(--st-fs-sm); }
+.web-toggle[aria-pressed="true"] { background: var(--st-accent-tint); border-color: var(--st-accent); color: var(--st-accent-text); }
+.web-toggle[data-down="true"] { opacity: 0.6; }

@@ -89,9 +89,8 @@ ModelFacts read_model_facts(const std::vector<std::string>& native_shards, const
             if (n == "per_layer_token_embd.weight") f.ple_table = true;
             if (has_suffix(n, ".ssm_alpha.weight")) f.gdn = true;
             if (has_suffix(n, ".indexer.q_proj.weight")) f.qsa = true;
-            if (n.find("hc_") != std::string::npos && (has_suffix(n, "_down.weight") || has_suffix(n, "_up.weight")) &&
-                t.type != 30)
-                f.hc_bf16 = false;
+            // (the hyper-connection weights reach the read from the pack, which stores them in BF16 whatever the GGUF
+            // holds - iq_pack converts Q8_0: so their GGUF type is not an assumption of the fork read)
             if (has_suffix(n, ".ffn_gate_exps.weight")) {
                 const std::string base = n.substr(0, n.size() - std::strlen("gate_exps.weight"));
                 const TensorInfo* d = model.find(base + "down_exps.weight");
@@ -175,7 +174,6 @@ int run_patch_guards(const ModelFacts& f) {
              if (m.n_embd != gr_n || m.hc != gr_hc || m.hc_lr != gr_lr)
                  return "n_embd " + str(m.n_embd) + ", " + str(m.hc) + " streams, low rank " + str(m.hc_lr) +
                         "; compiled for " + str(gr_n) + " / " + str(gr_hc) + " / " + str(gr_lr);
-             if (!m.hc_bf16) return "a hyper-connection down / up weight is not BF16 (the read takes BF16 rows)";
              return "";
          },
          [] { setenv_off("STRATA_GR_FORK", "0"); }},

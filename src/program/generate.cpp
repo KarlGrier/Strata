@@ -116,6 +116,7 @@
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
+#include "strata/spec/cost_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -19344,6 +19345,13 @@ int main(int argc, char** argv) {
                         wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = req_spec_min_p;
                         wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                         T = strata::spec::choose_window(wr);
+                        // (local, round 12) STRATA_COST_GATE (spec/cost_gate.hpp): an MTP round's window by the gate, in place of the
+                        // --spec-min-p rule choose_window applied - the branch the gate replaced on v0.2.8; only the MTP chain's own
+                        // candidates (not DFlash2's: req_df2; not STRATA_SPEC_COST's window)
+                        if (use_mtp && !req_df2 && req_spec_min_p > 0.0 &&
+                            !strata::spec::cost_window_applies(use_mtp, spec_cost, req_df2, first_window)) {
+                            if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                        }
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -21403,6 +21411,13 @@ int main(int argc, char** argv) {
                 wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = o.spec_min_p;
                 wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                 T = strata::spec::choose_window(wr);
+                // (local, round 12) STRATA_COST_GATE (spec/cost_gate.hpp): an MTP round's window by the gate, in place of the
+                // --spec-min-p rule choose_window applied - the branch the gate replaced on v0.2.8; only the MTP chain's own
+                // candidates (not DFlash2's: spec_uses_df2; not STRATA_SPEC_COST's window)
+                if (use_mtp && !spec_uses_df2 && o.spec_min_p > 0.0 &&
+                    !strata::spec::cost_window_applies(use_mtp, spec_cost, spec_uses_df2, first_window)) {
+                    if (strata::spec::cost_gate().on) T = strata::spec::cost_gate_T(dprob.data(), S_mtp);   // round 12
+                }
             }
             if (first_window) T = 1;
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());

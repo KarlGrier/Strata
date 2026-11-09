@@ -1084,7 +1084,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(std::max<uint64_t>(T * HC * N, (uint64_t) strata::kernels::kGrForkScratchMin));   // round 11 B.1
+        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
+        // round 11 B.1: the fork read's counters, sums of squares and partials in their own zeroed region - 0.1.39's
+        // batched PLE projects its keys into xn_, which overwrote them between two layers' reads (NaN)
+        grfk_ = b.take<float>((uint64_t) strata::kernels::kGrForkScratchMin);
         // the q8_1 activations of one token group (or one column chunk of the head): at most kVerifyMaxT columns
         const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
@@ -1623,7 +1626,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             // round 11 B.1: the fork's read keeps per-group counters and partials in its own scratch region
-            float* scr = fused_gr_fork_enabled() ? xn_ + (size_t) (grp < 2 ? grp : 1) * (size_t) kGrForkScratchFloats
+            float* scr = fused_gr_fork_enabled() ? grfk_ + (size_t) (grp < 2 ? grp : 1) * (size_t) kGrForkScratchFloats
                                                  : xn_ + (size_t) tb * HC * N;
             return fused_gr_read_multi(fa, n, scr, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
@@ -2601,7 +2604,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36;
                 }
             }
-            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs);
+            q8_head = fused_gr_read_multi(fa, HT, fused_gr_fork_enabled() ? grfk_ : xn_ + (size_t) h0 * HC * N, cs);   // round 11 B.1: own scratch (every column chunk)
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
@@ -2618,7 +2621,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC; a.mixed = head_mixed_ + t * N;
                 if (qcnt_ != nullptr) { a.q8_cnt = qcnt_; a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36; }
             }
-            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs);
+            q8_head = fused_gr_read_multi(fa, HT, fused_gr_fork_enabled() ? grfk_ : xn_ + (size_t) h0 * HC * N, cs);   // round 11 B.1: own scratch (every column chunk)
         } else {
             for (int t = h0; t < h0 + HT; ++t) {
                 BlockBuffers bb = ss.block;

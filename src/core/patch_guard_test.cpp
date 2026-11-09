@@ -9,6 +9,8 @@
 //    15: mmvq_il went with B.3; r22: draft_cum, prefill_v2 - 7 guards.  STRATA_PREFILL_V2 is unset before the header is read, so
 //    no GPU is probed: its GPU check is the synthetic case below.)
 #include "strata/core/patch_guard.hpp"
+#include "strata/core/geometry.hpp"
+#include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cstdio>
@@ -67,8 +69,11 @@ int main(int argc, char** argv) {
     int fail = 0;
     reset();
     const int off0 = strata::core::run_patch_guards(real);
-    std::printf("real header: %d off%s\n", off0, off0 ? "  FAIL" : "");
-    fail += off0 != 0;
+    // (v0.2.13 port: at a shape the fork read is not built for, STRATA_GR_FORK is the one switch the real header turns off)
+    const int want0 = strata::kernels::fused_gr_fork_built() ? 0 : 1;
+    const bool ok0 = off0 == want0 && (want0 == 0 || offs() == "STRATA_GR_FORK");
+    std::printf("real header: %d off (want %d)%s\n", off0, want0, ok0 ? "" : "  FAIL");
+    fail += !ok0;
 
     struct Case {
         const char* what;
@@ -81,17 +86,20 @@ int main(int argc, char** argv) {
         {"no QSA indexer layers", [](ModelFacts& m) { m.qsa = false; }, "STRATA_SIDE_MIXER"},
         {"full attention every 6 layers", [](ModelFacts& m) { m.full_attention_interval = 6; }, "STRATA_SIDE_MIXER"},
         {"head size 128", [](ModelFacts& m) { m.key_length = 128; }, "STRATA_QSA_SPLIT_ATTN"},
-        {"16 query heads per KV head", [](ModelFacts& m) { m.head_count = 32; }, "STRATA_QSA_SPLIT_ATTN"},
-        {"low rank 256", [](ModelFacts& m) { m.hc_lr = 256; }, "STRATA_GR_FORK"},
+        // (v0.2.13 port, F9: offsets from the compiled shape, so a case never equals it; Flash-Next: 32 heads, low rank 256)
+        {"4 more query heads per KV head", [](ModelFacts& m) {
+             const auto& G = strata::core::kCompiledGeometry;
+             m.head_count = m.head_count_kv * (G.n_head / G.n_head_kv + 4); }, "STRATA_QSA_SPLIT_ATTN"},
+        {"low rank 64 below the compiled", [](ModelFacts& m) { m.hc_lr = strata::core::kCompiledGeometry.hc_lr - 64; }, "STRATA_GR_FORK"},
         // a hidden size change hits every guard that depends on it: B.1 (compiled 2560), A.2 only when not a multiple
         // of 256
-        {"n_embd 3072", [](ModelFacts& m) { m.n_embd = 3072; }, "STRATA_GR_FORK"},
+        {"n_embd 512 above the compiled", [](ModelFacts& m) { m.n_embd = strata::core::kCompiledGeometry.n_embd + 512; }, "STRATA_GR_FORK"},
         {"n_embd 2600 (not a multiple of 256)", [](ModelFacts& m) { m.n_embd = 2600; }, "STRATA_ROUTER_Q8K"},
         // the cumulative draft length's table is the qwen4exp drafter's
         {"architecture qwen35moe", [](ModelFacts& m) { m.arch = "qwen35moe"; }, "STRATA_DRAFT_CUM"},
         {"an empty draft vocabulary", [](ModelFacts& m) { m.draft_vocab = 0; }, "STRATA_DRAFT_CUM"},
         // r22 prefill_v2 (asked for by reset()): the kernels' K, the formats they take, a GPU they run on
-        {"expert n_ff 768", [](ModelFacts& m) { m.n_ff = 768; }, "STRATA_PREFILL_V2"},
+        {"expert n_ff 128 above the compiled", [](ModelFacts& m) { m.n_ff = strata::core::kCompiledGeometry.n_ff + 128; }, "STRATA_PREFILL_V2"},
         {"no IQ3_XXS gate/up or IQ4_NL down", [](ModelFacts& m) { m.expert_types = {"IQ2_S/IQ4_XS", "IQ3_S/Q8_0"}; },
          "STRATA_PREFILL_V2"},
         {"no GPU for the v2 kernels", [](ModelFacts& m) { m.gpus_v2 = 0; }, "STRATA_PREFILL_V2"},

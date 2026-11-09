@@ -11,6 +11,8 @@
 #include <cstdint>
 
 namespace strata::kernels {
+/// v0.2.13 port (F12): the largest vocabulary the split sampler (exact speculative sampling) takes: 262,144
+int64_t sample_split_max_vocab();
 
 struct SamplerParams {
     int top_k = 20;              // sampled path: 1..64 as given; 0 (off) or more than 64 keep the widest list, 64

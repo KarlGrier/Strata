@@ -7,6 +7,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/sampler.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"   // the v2 kernels' compiled shapes (constants only: no link to the prefill)
 
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
@@ -166,6 +167,8 @@ int run_patch_guards(const ModelFacts& f) {
              if (m.draft_vocab == 0) return "the drafter's draft_vocab.bin is empty";
              if (m.draft_max_id >= m.n_vocab)
                  return "draft id " + str(m.draft_max_id) + " is outside the model's vocabulary of " + str(m.n_vocab);
+             if (m.n_vocab > strata::kernels::sample_split_max_vocab())   // v0.2.13 port, F12
+                 return "vocabulary " + str(m.n_vocab) + " above the split sampler's " + str(strata::kernels::sample_split_max_vocab());
              return "";
          },
          [] { setenv_off("STRATA_SPEC_EXACT", "0"); }},

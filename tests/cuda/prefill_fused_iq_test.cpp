@@ -457,7 +457,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
         } else {
             ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");
             ck(cudaDeviceSynchronize(), "sentinel");
-            run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, 20, E}, blob, s);
+            run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, std::min(20, E - 1), E}, blob, s);   // (as the fused part's cut)
             ck(cudaStreamSynchronize(s), "sync");
             const std::vector<float> y_2 = download(fb.dm, (size_t) rows * N);
             const std::vector<int32_t> slot2 = download_i(fb.slot, (size_t) rows);
@@ -467,7 +467,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
             std::printf("  v2    vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", e2r.rms, e2r.worst);
             std::printf("  v2    vs fused         : rel RMS %.3e  worst row max rel %.3e\n", e21.rms, e21.worst);
             double z2 = 0;
-            for (int k = 0; k < K; ++k)
+            for (int k = 0; k < K && ZERO >= 0; ++k)   // (ZERO -1: no all-zero token, as the fused part)
                 for (int o = 0; o < N; ++o)
                     z2 = std::max(z2, (double) std::fabs(y_2[(size_t) slot2[(size_t) (ZERO * K + k)] * N + o]));
             fused::native_v2_override(-1);

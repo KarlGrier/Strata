@@ -642,6 +642,10 @@ constexpr int kSplitWarpSpan = 32 * kSplitPerLane;              // 1,024 logits 
 constexpr int kSplitWarps = 4;
 constexpr int kSplitBlockSpan = kSplitWarps * kSplitWarpSpan;   // 4,096 logits per block
 constexpr int kSplitMaxBlocks = 64;                             // lists the merge holds: n_vocab <= 262,144
+}  // namespace
+// v0.2.13 port (F12): the largest vocabulary exact speculative sampling's split sampler takes (the spec_exact guard)
+int64_t sample_split_max_vocab() { return (int64_t) kSplitMaxBlocks * kSplitBlockSpan; }
+namespace {
 constexpr int kSplitMaxRows = 64;                               // rows per split launch (the scratch's bound)
 
 /// Merge `nl` (<= 64) lists of `k` candidates - list L at `lists[L * stride]`, each in the selection order and

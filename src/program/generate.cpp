@@ -15505,8 +15505,9 @@ int main(int argc, char** argv) {
             const size_t cells = (size_t) stash_qs.n_head_kv * (size_t) stash_qs.page_size;
             auto add = [&](const strata::core::QsaState& st) {
                 if (st.kv_q4) {                            // q4_0 (v0.1.8): 144 B per cell and head, K and V
-                    out.emplace_back((uint8_t*) st.host.k_q4, cells * 144);
-                    out.emplace_back((uint8_t*) st.host.v_q4, cells * 144);
+                    // (v0.2.13 port, F11: 144 = head_dim 256's q4_0 row)
+                    out.emplace_back((uint8_t*) st.host.k_q4, cells * (size_t) strata::kernels::kv_q4_bytes_per_head((int) stash_qs.head_dim));
+                    out.emplace_back((uint8_t*) st.host.v_q4, cells * (size_t) strata::kernels::kv_q4_bytes_per_head((int) stash_qs.head_dim));
                 } else if (st.kv_int8) {
                     out.emplace_back((uint8_t*) st.host.k_q, cells * (size_t) stash_qs.head_dim);
                     out.emplace_back((uint8_t*) st.host.v_q, cells * (size_t) stash_qs.head_dim);

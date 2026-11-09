@@ -3835,6 +3835,7 @@ class Service:
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
+        self.not_running = {}                         # Karl 11-06: the config's "model_not_running": {the other model's id: its error text}
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
@@ -6778,6 +6779,20 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                # Karl 11-06: a request naming the model that is NOT running gets a clear error, not this model's answer.
+                # Only the exact ids the config lists; any other name is served as always. 400: clients do not retry it
+                named = req.get("model")
+                why = svc.not_running.get(named) if isinstance(named, str) and \
+                    path in ("/v1/chat/completions", "/v1/messages", "/v1/responses") else None
+                if why:
+                    print(f"[strata] refused a request for {named}: this server runs {svc.model}", flush=True)
+                    if path == "/v1/responses":
+                        self._json(400, responses_error_body(why, "invalid_request_error", code="model_not_running"))
+                    elif path == "/v1/messages":
+                        self._json(400, {"type": "error", "error": {"type": "invalid_request_error", "message": why}})
+                    else:
+                        self._json(400, {"error": {"type": "invalid_request_error", "code": "model_not_running", "message": why}})
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -8480,6 +8495,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         raise SystemExit(f"[strata] config \"prevent_sleep\" must be true or false, not {cfg['prevent_sleep']!r}")
     from serve.keepawake import KeepAwake
     svc.keep_awake = KeepAwake.create(cfg.get("prevent_sleep") is True)      # #1727: opt-in, Windows only
+    if cfg.get("model_not_running"):                    # Karl 11-06: {the other model's id: the error its requests get}
+        svc.not_running = {k: v for k, v in cfg["model_not_running"].items() if isinstance(k, str) and isinstance(v, str) and v}
+        print(f"[strata] requests naming {', '.join(svc.not_running)} get a clear error (model_not_running in the config)", flush=True)
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")

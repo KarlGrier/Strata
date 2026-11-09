@@ -308,7 +308,9 @@ def _norm(url: str) -> str:
     a trailing slash or the fragment; it cannot add anything to the query)."""
     u = urllib.parse.urlsplit(url.strip())
     path = (u.path or "/").rstrip("/") or "/"
-    return (u.netloc or "").lower() + path + (f"?{u.query}" if u.query else "")
+    host = (u.netloc or "").lower()
+    host = host[4:] if host.startswith("www.") else host            # www.example.com = example.com
+    return host + path + (f"?{u.query}" if u.query else "")
 
 
 # ------------------------------------------------------------------------------------------------ the tools
@@ -339,7 +341,18 @@ class WebHub:
         return {t["name"]: (self.source, t["name"]) for t in TOOLS}
 
     def template_tools(self, exclude=()):
-        return [dict(t) for t in TOOLS if t["name"] not in exclude]
+        # the model cannot know the date: web_search's description carries it (so "today" searches for today; it
+        # changes once a day, which re-reads a chat once)
+        today = time.strftime("%A, %B %-d, %Y")
+        out = []
+        for t in TOOLS:
+            if t["name"] in exclude:
+                continue
+            t = dict(t)
+            if t["name"] == "web_search":
+                t["description"] = f"Today is {today} (local date on this PC). " + t["description"]
+            out.append(t)
+        return out
 
     def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
         t0 = time.monotonic()
